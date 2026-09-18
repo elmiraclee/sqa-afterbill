@@ -313,6 +313,22 @@ $bills = $stmt->fetchAll();
         .status-badge.unpaid  { background: #FFFBEB; color: #B45309; }
         .status-badge.overdue { background: #FEF2F2; color: #B91C1C; }
 
+        .btn-pay {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 12px;
+            background: none;
+            border: 1.5px solid var(--electric-blue);
+            border-radius: 7px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--electric-blue);
+            text-decoration: none;
+            white-space: nowrap;
+        }
+
+        .btn-pay:hover { background: var(--electric-blue); color: #fff; }
+
         .empty-state { padding: 48px 22px; text-align: center; color: var(--text-muted); }
         .empty-state svg { width: 44px; height: 44px; margin: 0 auto 12px; opacity: 0.35; }
         .empty-state p { font-size: 0.85rem; margin-bottom: 16px; }
@@ -392,6 +408,10 @@ $bills = $stmt->fetchAll();
                 <div class="alert alert-success">Bill added successfully.</div>
             <?php endif; ?>
 
+            <?php if (isset($_GET['paid'])): ?>
+                <div class="alert alert-success">Payment recorded. Bill marked as paid.</div>
+            <?php endif; ?>
+
             <form method="GET" action="" class="filter-bar">
                 <div class="filter-group">
                     <label for="status">Status</label>
@@ -441,6 +461,7 @@ $bills = $stmt->fetchAll();
                                     <th>Amount</th>
                                     <th>Due Date</th>
                                     <th>Status</th>
+                                    <th>Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -468,6 +489,11 @@ $bills = $stmt->fetchAll();
                                         <td>₱<?= number_format((float)$bill['amount'], 2) ?></td>
                                         <td><?= htmlspecialchars((new DateTime($bill['due_date']))->format('M j, Y')) ?></td>
                                         <td><span class="status-badge <?= $statusClass ?>"><?= $statusLabel ?></span></td>
+                                        <td>
+                                            <?php if ($bill['status'] === 'unpaid'): ?>
+                                                <a href="mark_paid.php?bill_id=<?= (int)$bill['bill_id'] ?>" class="btn-pay">Mark as Paid</a>
+                                            <?php endif; ?>
+                                        </td>
                                     </tr>
                                 <?php endforeach; ?>
                             </tbody>
