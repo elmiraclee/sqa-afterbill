@@ -214,6 +214,7 @@ $bills = $stmt->fetchAll();
 
         .alert { padding: 12px 16px; border-radius: 8px; font-size: 0.82rem; margin-bottom: 18px; }
         .alert-success { background: #ECFDF5; color: #047857; }
+        .alert-error { background: #FEF2F2; color: #B91C1C; }
 
         .filter-bar {
             background: var(--white);
@@ -329,6 +330,43 @@ $bills = $stmt->fetchAll();
 
         .btn-pay:hover { background: var(--electric-blue); color: #fff; }
 
+        .actions-cell { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+        .btn-edit {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 12px;
+            background: none;
+            border: 1.5px solid var(--border);
+            border-radius: 7px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-decoration: none;
+            white-space: nowrap;
+        }
+
+        .btn-edit:hover { border-color: var(--text-muted); color: var(--text-dark); }
+
+        .delete-form { display: inline-block; margin: 0; }
+
+        .btn-delete {
+            display: inline-flex;
+            align-items: center;
+            padding: 6px 12px;
+            background: none;
+            border: 1.5px solid var(--danger);
+            border-radius: 7px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            font-family: inherit;
+            color: var(--danger);
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .btn-delete:hover { background: var(--danger); color: #fff; }
+
         .empty-state { padding: 48px 22px; text-align: center; color: var(--text-muted); }
         .empty-state svg { width: 44px; height: 44px; margin: 0 auto 12px; opacity: 0.35; }
         .empty-state p { font-size: 0.85rem; margin-bottom: 16px; }
@@ -412,6 +450,18 @@ $bills = $stmt->fetchAll();
                 <div class="alert alert-success">Payment recorded. Bill marked as paid.</div>
             <?php endif; ?>
 
+            <?php if (isset($_GET['updated'])): ?>
+                <div class="alert alert-success">Bill updated successfully.</div>
+            <?php endif; ?>
+
+            <?php if (isset($_GET['deleted'])): ?>
+                <div class="alert alert-success">Bill deleted successfully.</div>
+            <?php endif; ?>
+
+            <?php if (isset($_GET['delete_blocked'])): ?>
+                <div class="alert alert-error">This bill has recorded payments and can't be deleted. Remove its payment history first if you really need to delete it.</div>
+            <?php endif; ?>
+
             <form method="GET" action="" class="filter-bar">
                 <div class="filter-group">
                     <label for="status">Status</label>
@@ -490,9 +540,17 @@ $bills = $stmt->fetchAll();
                                         <td><?= htmlspecialchars((new DateTime($bill['due_date']))->format('M j, Y')) ?></td>
                                         <td><span class="status-badge <?= $statusClass ?>"><?= $statusLabel ?></span></td>
                                         <td>
-                                            <?php if ($bill['status'] === 'unpaid'): ?>
-                                                <a href="mark_paid.php?bill_id=<?= (int)$bill['bill_id'] ?>" class="btn-pay">Mark as Paid</a>
-                                            <?php endif; ?>
+                                            <div class="actions-cell">
+                                                <?php if ($bill['status'] === 'unpaid'): ?>
+                                                    <a href="mark_paid.php?bill_id=<?= (int)$bill['bill_id'] ?>" class="btn-pay">Mark as Paid</a>
+                                                <?php endif; ?>
+                                                <a href="edit_bill.php?bill_id=<?= (int)$bill['bill_id'] ?>" class="btn-edit">Edit</a>
+                                                <form method="POST" action="delete_bill.php" class="delete-form"
+                                                    onsubmit="return confirm('Delete ' + <?= htmlspecialchars(json_encode($bill['bill_name']), ENT_QUOTES) ?> + '? This cannot be undone.');">
+                                                    <input type="hidden" name="bill_id" value="<?= (int)$bill['bill_id'] ?>">
+                                                    <button type="submit" class="btn-delete">Delete</button>
+                                                </form>
+                                            </div>
                                         </td>
                                     </tr>
                                 <?php endforeach; ?>
