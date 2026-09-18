@@ -27,6 +27,55 @@ if ($hour >= 5 && $hour < 12) {
 } else {
     $greeting = 'Good evening';
 }
+
+// Dashboard stats (FR-04)
+require_once __DIR__ . '/config/database.php';
+$pdo = getPDO();
+
+// Bills due this calendar month, grouped by status: one query gives count + sum per status.
+$monthStmt = $pdo->prepare(
+    'SELECT status, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
+     FROM bills
+     WHERE user_id = ?
+       AND YEAR(due_date) = YEAR(CURDATE())
+       AND MONTH(due_date) = MONTH(CURDATE())
+     GROUP BY status'
+);
+$monthStmt->execute([$_SESSION['user_id']]);
+$monthRows = $monthStmt->fetchAll();
+
+$paidCount = 0;
+$paidSum = 0.0;
+$unpaidCount = 0;
+$unpaidSum = 0.0;
+
+foreach ($monthRows as $row) {
+    if ($row['status'] === 'paid') {
+        $paidCount = (int)$row['cnt'];
+        $paidSum = (float)$row['total'];
+    } elseif ($row['status'] === 'unpaid') {
+        $unpaidCount = (int)$row['cnt'];
+        $unpaidSum = (float)$row['total'];
+    }
+}
+
+$billsThisMonth = $paidCount + $unpaidCount;
+$monthlyTotalExpenses = $paidSum + $unpaidSum;
+
+// Upcoming (next 7 days) and overdue counts among unpaid bills, computed live — not restricted
+// to this month, and "overdue" is never stored, same logic as bills.php.
+$rangeStmt = $pdo->prepare(
+    "SELECT
+        SUM(CASE WHEN due_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 7 DAY) THEN 1 ELSE 0 END) AS upcoming_count,
+        SUM(CASE WHEN due_date < CURDATE() THEN 1 ELSE 0 END) AS overdue_count
+     FROM bills
+     WHERE user_id = ? AND status = 'unpaid'"
+);
+$rangeStmt->execute([$_SESSION['user_id']]);
+$rangeRow = $rangeStmt->fetch();
+
+$upcomingCount = (int)($rangeRow['upcoming_count'] ?? 0);
+$overdueCount = (int)($rangeRow['overdue_count'] ?? 0);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -367,6 +416,7 @@ if ($hour >= 5 && $hour < 12) {
         .stat-icon.blue  { background: rgba(59,130,246,0.1); color: var(--electric-blue); }
         .stat-icon.green { background: rgba(16,185,129,0.1); color: var(--success); }
         .stat-icon.amber { background: rgba(245,158,11,0.1); color: var(--warning); }
+        .stat-icon.red   { background: rgba(239,68,68,0.1); color: var(--danger); }
 
         .stat-body {}
 
@@ -673,8 +723,8 @@ if ($hour >= 5 && $hour < 12) {
                         </svg>
                     </div>
                     <div class="stat-body">
-                        <div class="stat-value">0</div>
-                        <div class="stat-label">Total Bills</div>
+                        <div class="stat-value"><?= $billsThisMonth ?></div>
+                        <div class="stat-label">Total Bills This Month</div>
                     </div>
                 </div>
 
@@ -685,8 +735,8 @@ if ($hour >= 5 && $hour < 12) {
                         </svg>
                     </div>
                     <div class="stat-body">
-                        <div class="stat-value">₱0</div>
-                        <div class="stat-label">Paid This Month</div>
+                        <div class="stat-value">₱<?= number_format($paidSum, 2) ?></div>
+                        <div class="stat-label"><?= $paidCount ?> bill<?= $paidCount === 1 ? '' : 's' ?> paid this month</div>
                     </div>
                 </div>
 
@@ -697,8 +747,44 @@ if ($hour >= 5 && $hour < 12) {
                         </svg>
                     </div>
                     <div class="stat-body">
-                        <div class="stat-value">₱0</div>
-                        <div class="stat-label">Upcoming Bills</div>
+                        <div class="stat-value">₱<?= number_format($unpaidSum, 2) ?></div>
+                        <div class="stat-label"><?= $unpaidCount ?> bill<?= $unpaidCount === 1 ? '' : 's' ?> unpaid this month</div>
+                    </div>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-icon blue">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 012.25-2.25h13.5A2.25 2.25 0 0121 7.5v11.25m-18 0A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75m-18 0v-7.5A2.25 2.25 0 015.25 9h13.5A2.25 2.25 0 0121 11.25v7.5"/>
+                        </svg>
+                    </div>
+                    <div class="stat-body">
+                        <div class="stat-value"><?= $upcomingCount ?></div>
+                        <div class="stat-label">Due in the next 7 days</div>
+                    </div>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-icon red">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"/>
+                        </svg>
+                    </div>
+                    <div class="stat-body">
+                        <div class="stat-value"><?= $overdueCount ?></div>
+                        <div class="stat-label">Overdue bill<?= $overdueCount === 1 ? '' : 's' ?></div>
+                    </div>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-icon green">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z"/>
+                        </svg>
+                    </div>
+                    <div class="stat-body">
+                        <div class="stat-value">₱<?= number_format($monthlyTotalExpenses, 2) ?></div>
+                        <div class="stat-label">Total Expenses This Month</div>
                     </div>
                 </div>
             </div>
