@@ -11,11 +11,17 @@ if (!isset($_SESSION['user_id'])) {
 }
 
 require_once __DIR__ . '/config/database.php';
+require_once __DIR__ . '/includes/recurring_bills.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
 
 $pdo = getPDO();
+
+// Catch up any recurring bills whose cycle has passed before listing, so newly generated
+// bills show up immediately.
+generateMissedRecurringBills($pdo, (int)$_SESSION['user_id']);
+
 $categories = $pdo->query('SELECT category_id, category_name FROM categories ORDER BY category_id')->fetchAll();
 $validCategoryIds = array_column($categories, 'category_id');
 
