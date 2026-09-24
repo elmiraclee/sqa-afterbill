@@ -433,8 +433,12 @@ $bills = $stmt->fetchAll();
                 <div class="alert alert-success">Bill deleted successfully.</div>
             <?php endif; ?>
 
+            <?php if (isset($_GET['unpaid'])): ?>
+                <div class="alert alert-success">Payment undone. Bill is unpaid again.</div>
+            <?php endif; ?>
+
             <?php if (isset($_GET['delete_blocked'])): ?>
-                <div class="alert alert-error">This bill has recorded payments and can't be deleted. Remove its payment history first if you really need to delete it.</div>
+                <div class="alert alert-error">This bill has recorded payments and can't be deleted. Use "Undo Payment" first if you really need to delete it.</div>
             <?php endif; ?>
 
             <form method="GET" action="" class="filter-bar">
@@ -518,6 +522,13 @@ $bills = $stmt->fetchAll();
                                             <div class="actions-cell">
                                                 <?php if ($bill['status'] === 'unpaid'): ?>
                                                     <a href="mark_paid.php?bill_id=<?= (int)$bill['bill_id'] ?>" class="btn-pay">Mark as Paid</a>
+                                                <?php else: ?>
+                                                    <form method="POST" action="undo_payment.php" class="delete-form"
+                                                        onsubmit="return confirm('Undo the payment for ' + <?= htmlspecialchars(json_encode($bill['bill_name']), ENT_QUOTES) ?> + '? Its payment record will be removed and the bill set back to unpaid.');">
+                                                        <input type="hidden" name="bill_id" value="<?= (int)$bill['bill_id'] ?>">
+                                                        <input type="hidden" name="return" value="bills">
+                                                        <button type="submit" class="btn-edit" style="cursor:pointer;font-family:inherit;">Undo Payment</button>
+                                                    </form>
                                                 <?php endif; ?>
                                                 <a href="edit_bill.php?bill_id=<?= (int)$bill['bill_id'] ?>" class="btn-edit">Edit</a>
                                                 <form method="POST" action="delete_bill.php" class="delete-form"
