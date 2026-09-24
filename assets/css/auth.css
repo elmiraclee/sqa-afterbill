@@ -35,37 +35,66 @@ html, body {
 }
 
 .auth-page {
+    position: relative;
     min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 24px;
-    background:
-        radial-gradient(ellipse at 20% 50%, rgba(59, 130, 246, 0.08) 0%, transparent 50%),
-        radial-gradient(ellipse at 80% 20%, rgba(23, 35, 60, 0.06) 0%, transparent 45%),
-        var(--light-gray);
+    background: var(--light-gray);
 }
 
-/* ── Smaller, tighter card ── */
+.back-home {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 14px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    color: rgba(255, 255, 255, 0.75);
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-decoration: none;
+    margin-bottom: 20px;
+    transition: background 0.2s, border-color 0.2s, color 0.2s, transform 0.15s;
+}
+
+.back-home:hover {
+    background: rgba(59, 130, 246, 0.16);
+    border-color: rgba(59, 130, 246, 0.4);
+    color: #fff;
+    transform: translateX(-2px);
+}
+
+.back-home svg {
+    width: 14px;
+    height: 14px;
+}
+
+/* ── Full-height split screen (fills the viewport, no floating card) ── */
 .auth-card {
     display: flex;
     width: 100%;
-    max-width: 820px;
-    min-height: 560px;
+    min-height: 100vh;
     background: var(--white);
-    border-radius: var(--radius);
-    box-shadow: var(--shadow);
-    overflow: hidden;
+    animation: authFadeIn 0.4s ease-out;
+}
+
+@keyframes authFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .auth-card { animation: none; }
 }
 
 .auth-brand {
-    flex: 0 0 40%;
+    flex: 0 0 42%;
     background: linear-gradient(160deg, var(--deep-navy) 0%, #0F172A 100%);
     color: var(--white);
-    padding: 28px 28px;
+    padding: 56px 48px;
     display: flex;
     flex-direction: column;
-    justify-content: space-between;
+    justify-content: center;
+    gap: 48px;
     position: relative;
     overflow: hidden;
 }
@@ -140,19 +169,14 @@ html, body {
 .brand-art {
     position: relative;
     z-index: 1;
-    margin: 16px 0 16px;
     display: flex;
     justify-content: center;
     align-items: center;
 }
 
-.brand-art--register {
-    margin-top: 85px;
-}
-
 .brand-art svg {
     width: 100%;
-    max-width: 200px;
+    max-width: 260px;
     height: auto;
     display: block;
     margin: 0 auto;
@@ -189,11 +213,10 @@ html, body {
 .brand-features {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 14px;
     position: relative;
     z-index: 1;
-    margin-top: auto;
-    padding-top: 16px;
+    padding-top: 24px;
     border-top: 1px solid rgba(255, 255, 255, 0.1);
     list-style: none;
 }
@@ -235,7 +258,7 @@ html, body {
 
 .auth-form-inner {
     width: 100%;
-    max-width: 360px;
+    max-width: 400px;
 }
 
 /* ── Logo — centered ── */
@@ -466,12 +489,11 @@ html, body {
 @media (max-width: 800px) {
     .auth-card {
         flex-direction: column;
-        max-width: 420px;
-        min-height: auto;
+        min-height: 100vh;
     }
     .auth-brand {
         flex: none;
-        padding: 24px 20px;
+        padding: 32px 20px 24px;
     }
     .brand-headline {
         font-size: 1.35rem;
@@ -486,14 +508,11 @@ html, body {
         max-width: 180px;
     }
     .auth-form-panel {
-        padding: 24px 20px;
+        padding: 32px 20px;
     }
 }
 
 @media (max-width: 420px) {
-    .auth-page {
-        padding: 12px;
-    }
     .form-header h1 {
         font-size: 1.25rem;
     }

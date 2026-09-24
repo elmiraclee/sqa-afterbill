@@ -98,6 +98,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <!-- Left Brand Panel -->
             <div class="auth-brand">
                 <div class="brand-top">
+                    <a href="../index.php" class="back-home">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
+                        </svg>
+                        Back to Home
+                    </a>
                     <div class="brand-tagline">Monthly Bill Tracker</div>
 
                     <h1 class="brand-headline">Stay on top of<br>your bills, <span>always.</span></h1>
@@ -105,7 +111,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
 
                 <!-- Icon illustration (pure SVG – no raster image) -->
-                <div class="brand-art brand-art--register" aria-hidden="true">
+                <div class="brand-art" aria-hidden="true">
                     <svg viewBox="0 0 336 200" xmlns="http://www.w3.org/2000/svg" role="presentation" focusable="false">
                         <defs>
                             <linearGradient id="abGlow" x1="0" y1="0" x2="1" y2="1">
@@ -326,6 +332,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 
-    <script src="../assets/js/register.js"></script>
+    <script src="../assets/js/auth.js"></script>
 </body>
 </html>
