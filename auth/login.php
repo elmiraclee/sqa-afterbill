@@ -181,7 +181,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <div class="auth-form-panel">
                 <div class="auth-form-inner">
                     <div class="form-logo">
-                        <img src="../assets/images/logo.png" alt="AfterBill">
+                        <a href="../index.php" title="Back to home"><img src="../assets/images/logo.png" alt="AfterBill"></a>
                     </div>
                     <div class="form-header">
                         <h1>Welcome back</h1>
@@ -239,7 +239,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     </form>
 
                     <div class="form-footer">
-                        Don't have an account? <a href="register.php">Register</a>
+                        Don't have an account? <a href="register.php">Register</a><br><a href="../index.php" style="font-weight:500;color:#6B7280;">&larr; Back to home</a>
                     </div>
                 </div>
             </div>
