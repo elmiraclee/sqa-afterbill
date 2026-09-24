@@ -35,6 +35,11 @@ if (!ctype_digit((string)$categoryFilter) || !in_array((int)$categoryFilter, $va
     $categoryFilter = '';
 }
 
+$search = trim($_GET['q'] ?? '');
+if (mb_strlen($search) > 100) {
+    $search = mb_substr($search, 0, 100);
+}
+
 $sql = 'SELECT b.bill_id, b.bill_name, b.amount, b.due_date, b.is_recurring, b.status,
                c.category_name,
                (b.status = \'unpaid\' AND b.due_date < CURDATE()) AS is_overdue
@@ -51,12 +56,19 @@ if ($categoryFilter !== '') {
     $sql .= ' AND b.category_id = ?';
     $params[] = (int)$categoryFilter;
 }
+if ($search !== '') {
+    $sql .= ' AND b.bill_name LIKE ?';
+    $params[] = '%' . addcslashes($search, '%_\\') . '%';
+}
 
 $sql .= ' ORDER BY b.due_date ASC';
 
 $stmt = $pdo->prepare($sql);
 $stmt->execute($params);
 $bills = $stmt->fetchAll();
+
+$listTotal = array_sum(array_map(fn($b) => (float)$b['amount'], $bills));
+$hasFilters = $statusFilter !== '' || $categoryFilter !== '' || $search !== '';
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -237,7 +249,8 @@ $bills = $stmt->fetchAll();
         .filter-group { display: flex; flex-direction: column; gap: 6px; }
         .filter-group label { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.4px; }
 
-        .filter-group select {
+        .filter-group select,
+        .filter-group input[type="search"] {
             padding: 8px 12px;
             border: 1.5px solid var(--border);
             border-radius: 8px;
@@ -397,7 +410,7 @@ $bills = $stmt->fetchAll();
         <header class="topbar">
             <div class="topbar-left">
                 <h2>My Bills</h2>
-                <p><?= count($bills) ?> bill<?= count($bills) === 1 ? '' : 's' ?> found</p>
+                <p><?= count($bills) ?> bill<?= count($bills) === 1 ? '' : 's' ?> found · ₱<?= number_format($listTotal, 2) ?> total</p>
             </div>
             <div class="topbar-right">
                 <a href="add_bill.php" class="btn-primary">
@@ -439,6 +452,11 @@ $bills = $stmt->fetchAll();
 
             <form method="GET" action="" class="filter-bar">
                 <div class="filter-group">
+                    <label for="q">Search</label>
+                    <input type="search" id="q" name="q" placeholder="Bill name…" value="<?= htmlspecialchars($search) ?>">
+                </div>
+
+                <div class="filter-group">
                     <label for="status">Status</label>
                     <select id="status" name="status" onchange="this.form.submit()">
                         <option value="" <?= $statusFilter === '' ? 'selected' : '' ?>>All</option>
@@ -460,7 +478,9 @@ $bills = $stmt->fetchAll();
                     </select>
                 </div>
 
-                <?php if ($statusFilter !== '' || $categoryFilter !== ''): ?>
+                <button type="submit" class="btn-primary">Search</button>
+
+                <?php if ($hasFilters): ?>
                     <div class="filter-actions">
                         <a href="bills.php" class="btn-clear">Clear filters</a>
                     </div>
