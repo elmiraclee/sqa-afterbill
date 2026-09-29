@@ -677,6 +677,13 @@ $upcomingBills = $upcomingListStmt->fetchAll();
                 </div>
             </div>
 
+            <?php if ($overdueCount > 0): ?>
+                <a href="reminders.php" style="display:flex;align-items:center;justify-content:space-between;gap:12px;background:#FEF2F2;border:1px solid #FECACA;color:#B91C1C;border-radius:12px;padding:14px 20px;margin-bottom:24px;text-decoration:none;font-size:0.88rem;font-weight:600;">
+                    <span>⚠ You have <?= $overdueCount ?> overdue bill<?= $overdueCount === 1 ? '' : 's' ?>. Pay <?= $overdueCount === 1 ? 'it' : 'them' ?> as soon as possible.</span>
+                    <span>View reminders →</span>
+                </a>
+            <?php endif; ?>
+
             <!-- Stats -->
             <div class="stats-grid">
                 <div class="stat-card">
