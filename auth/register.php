@@ -12,6 +12,8 @@ if (isset($_SESSION['user_id'])) {
 }
 
 require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/csrf.php';
+require_once __DIR__ . '/../includes/activity.php';
 
 $errors = [];
 $success = false;
@@ -30,14 +32,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $old['full_name'] = $fullName;
     $old['email']     = $email;
 
-    if (strlen($fullName) < 2) {
+    if (!csrf_valid()) {
+        $errors[] = CSRF_ERROR;
+    }
+    // Length limits match the users columns (varchar 120 / 180) and account.php, so nothing is
+    // silently truncated by the database.
+    if (mb_strlen($fullName) < 2) {
         $errors[] = 'Full name must be at least 2 characters.';
+    } elseif (mb_strlen($fullName) > 120) {
+        $errors[] = 'Full name must be 120 characters or fewer.';
     }
     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $errors[] = 'Please enter a valid email address.';
+    } elseif (mb_strlen($email) > 180) {
+        $errors[] = 'Email must be 180 characters or fewer.';
     }
+    // 72 bytes is bcrypt's limit: password_hash() would silently ignore anything past it.
     if (strlen($password) < 8) {
         $errors[] = 'Password must be at least 8 characters.';
+    } elseif (strlen($password) > 72) {
+        $errors[] = 'Password must be 72 characters or fewer.';
     }
     if ($password !== $confirm) {
         $errors[] = 'Passwords do not match.';
@@ -70,8 +84,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             // Auto-login: set session and redirect to dashboard
             $newId = $pdo->lastInsertId();
+            session_regenerate_id(true); // same session-fixation guard as login.php
             $_SESSION['user_id']   = $newId;
             $_SESSION['user_name'] = $fullName;
+            logActivity($pdo, (int)$newId, 'register');
             header('Location: ../dashboard.php');
             exit;
         } catch (PDOException $e) {
@@ -214,7 +230,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <div class="auth-form-panel">
                 <div class="auth-form-inner">
                     <div class="form-logo">
-                        <img src="../assets/images/logo.png" alt="AfterBill">
+                        <a href="../index.php" title="Back to home"><img src="../assets/images/logo.png" alt="AfterBill"></a>
                     </div>
                     <div class="form-header">
                         <h1>Create Account</h1>
@@ -240,6 +256,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     <?php if (!$success): ?>
                     <form id="registerForm" method="POST" action="" novalidate>
+                        <?= csrf_field() ?>
                         <div class="form-group">
                             <label for="full_name">Full Name</label>
                             <div class="input-wrapper">
@@ -319,7 +336,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <?php endif; ?>
 
                     <div class="form-footer">
-                        Already have an account? <a href="login.php">Log in</a>
+                        Already have an account? <a href="login.php">Log in</a><br><a href="../index.php" style="font-weight:500;color:#6B7280;">&larr; Back to home</a>
                     </div>
                 </div>
             </div>
