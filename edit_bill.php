@@ -11,6 +11,9 @@ if (!isset($_SESSION['user_id'])) {
 }
 
 require_once __DIR__ . '/config/database.php';
+require_once __DIR__ . '/includes/csrf.php';
+require_once __DIR__ . '/includes/activity.php';
+require_once __DIR__ . '/includes/budgets.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -61,6 +64,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $old['category_id']  = $categoryId;
     $old['is_recurring'] = $isRecurring;
 
+    if (!csrf_valid()) {
+        $errors[] = CSRF_ERROR;
+    }
     if (strlen($billName) < 2 || strlen($billName) > 100) {
         $errors[] = 'Bill name must be between 2 and 100 characters.';
     }
@@ -70,6 +76,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $dueDateObj = DateTime::createFromFormat('Y-m-d', $dueDate);
     if (!$dueDateObj || $dueDateObj->format('Y-m-d') !== $dueDate) {
         $errors[] = 'Please enter a valid due date.';
+    } elseif ($dueDate < '2000-01-01' || $dueDate > '2100-12-31') {
+        // Same range as add_bill.php.
+        $errors[] = 'Due date must be between the years 2000 and 2100.';
     }
     if (!ctype_digit((string)$categoryId) || !in_array((int)$categoryId, $validCategoryIds, true)) {
         $errors[] = 'Please select a valid category.';
@@ -91,6 +100,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $billId,
                 $_SESSION['user_id'],
             ]);
+
+            $userId = (int)$_SESSION['user_id'];
+            logActivity($pdo, $userId, 'bill_updated', sprintf(
+                '%s — %s, due %s',
+                $billName,
+                activityMoney((float)$amount),
+                $dueDateObj->format('M j, Y')
+            ));
+            $budgetWarning = budgetWarningFor($pdo, $userId, (int)$categoryId, $dueDate);
+            if ($budgetWarning !== null) {
+                $_SESSION['flash_budget_warning'] = $budgetWarning;
+            }
 
             header('Location: bills.php?updated=1');
             exit;
@@ -339,12 +360,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <p>Update the details of this bill.</p>
             </div>
             <div class="topbar-right">
-                <a href="auth/logout.php" class="btn-logout">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"/>
-                    </svg>
-                    Logout
-                </a>
+                <?php require __DIR__ . '/partials/logout-button.php'; ?>
             </div>
         </header>
 
@@ -365,6 +381,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <?php endif; ?>
 
                 <form method="POST" action="" novalidate>
+                    <?= csrf_field() ?>
                     <input type="hidden" name="bill_id" value="<?= (int)$billId ?>">
 
                     <div class="form-group">

@@ -11,6 +11,8 @@ if (!isset($_SESSION['user_id'])) {
 }
 
 require_once __DIR__ . '/config/database.php';
+require_once __DIR__ . '/includes/csrf.php';
+require_once __DIR__ . '/includes/activity.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -65,6 +67,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $old['payment_method'] = $paymentMethod;
     $old['notes']          = $notes;
 
+    if (!csrf_valid()) {
+        $errors[] = CSRF_ERROR;
+    }
+
     $paymentDateObj = DateTime::createFromFormat('Y-m-d', $paymentDate);
     if (!$paymentDateObj || $paymentDateObj->format('Y-m-d') !== $paymentDate) {
         $errors[] = 'Please enter a valid payment date.';
@@ -104,6 +110,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $update->execute([$bill['bill_id'], $_SESSION['user_id']]);
 
             $pdo->commit();
+            logActivity($pdo, (int)$_SESSION['user_id'], 'payment_recorded', sprintf(
+                '%s — %s via %s',
+                $bill['bill_name'],
+                activityMoney((float)$amountPaid),
+                $paymentMethodLabels[$paymentMethod]
+            ));
 
             header('Location: bills.php?paid=1');
             exit;
@@ -367,12 +379,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <p>Record a payment for this bill.</p>
             </div>
             <div class="topbar-right">
-                <a href="auth/logout.php" class="btn-logout">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"/>
-                    </svg>
-                    Logout
-                </a>
+                <?php require __DIR__ . '/partials/logout-button.php'; ?>
             </div>
         </header>
 
@@ -398,6 +405,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <?php endif; ?>
 
                 <form method="POST" action="" novalidate>
+                    <?= csrf_field() ?>
                     <input type="hidden" name="bill_id" value="<?= (int)$bill['bill_id'] ?>">
 
                     <div class="form-group">

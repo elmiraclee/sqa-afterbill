@@ -12,6 +12,8 @@ if (!isset($_SESSION['user_id'])) {
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/recurring_bills.php';
+require_once __DIR__ . '/includes/csrf.php';
+require_once __DIR__ . '/includes/csv.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -67,8 +69,36 @@ $stmt = $pdo->prepare($sql);
 $stmt->execute($params);
 $bills = $stmt->fetchAll();
 
+// CSV export of exactly what the current filters show (same idea as payments.php).
+if (($_GET['export'] ?? '') === 'csv') {
+    $out = csvStart('afterbill-bills-' . date('Y-m-d') . '.csv');
+    fputcsv($out, ['Bill', 'Category', 'Amount', 'Due Date', 'Status', 'Recurring']);
+    foreach ($bills as $b) {
+        fputcsv($out, [
+            csvSafe($b['bill_name']),
+            csvSafe($b['category_name']),
+            number_format((float)$b['amount'], 2, '.', ''),
+            $b['due_date'],
+            $b['is_overdue'] ? 'Overdue' : ucfirst($b['status']),
+            $b['is_recurring'] ? 'Monthly' : 'No',
+        ]);
+    }
+    fclose($out);
+    exit;
+}
+
 $listTotal = array_sum(array_map(fn($b) => (float)$b['amount'], $bills));
 $hasFilters = $statusFilter !== '' || $categoryFilter !== '' || $search !== '';
+$exportQuery = http_build_query(array_filter([
+    'status'      => $statusFilter,
+    'category_id' => $categoryFilter,
+    'q'           => $search,
+    'export'      => 'csv',
+], fn($v) => $v !== ''));
+
+// One-time warning set by add_bill.php / edit_bill.php when a bill pushes its category over budget.
+$budgetWarning = $_SESSION['flash_budget_warning'] ?? null;
+unset($_SESSION['flash_budget_warning']);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -419,12 +449,10 @@ $hasFilters = $statusFilter !== '' || $categoryFilter !== '' || $search !== '';
                     </svg>
                     Add Bill
                 </a>
-                <a href="auth/logout.php" class="btn-logout">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"/>
-                    </svg>
-                    Logout
-                </a>
+                <?php if ($bills): ?>
+                    <a href="bills.php?<?= htmlspecialchars($exportQuery) ?>" class="btn-edit" title="Download the bills shown below as a spreadsheet">Export CSV</a>
+                <?php endif; ?>
+                <?php require __DIR__ . '/partials/logout-button.php'; ?>
             </div>
         </header>
 
@@ -432,6 +460,10 @@ $hasFilters = $statusFilter !== '' || $categoryFilter !== '' || $search !== '';
 
             <?php if (isset($_GET['added'])): ?>
                 <div class="alert alert-success">Bill added successfully.</div>
+            <?php endif; ?>
+
+            <?php if ($budgetWarning !== null): ?>
+                <div class="alert alert-error">⚠ <?= htmlspecialchars($budgetWarning) ?> <a href="budgets.php">View budgets</a></div>
             <?php endif; ?>
 
             <?php if (isset($_GET['paid'])): ?>
@@ -547,6 +579,7 @@ $hasFilters = $statusFilter !== '' || $categoryFilter !== '' || $search !== '';
                                                         onsubmit="return confirm('Undo the payment for ' + <?= htmlspecialchars(json_encode($bill['bill_name']), ENT_QUOTES) ?> + '? Its payment record will be removed and the bill set back to unpaid.');">
                                                         <input type="hidden" name="bill_id" value="<?= (int)$bill['bill_id'] ?>">
                                                         <input type="hidden" name="return" value="bills">
+                                                        <?= csrf_field() ?>
                                                         <button type="submit" class="btn-edit" style="cursor:pointer;font-family:inherit;">Undo Payment</button>
                                                     </form>
                                                 <?php endif; ?>
@@ -554,6 +587,7 @@ $hasFilters = $statusFilter !== '' || $categoryFilter !== '' || $search !== '';
                                                 <form method="POST" action="delete_bill.php" class="delete-form"
                                                     onsubmit="return confirm('Delete ' + <?= htmlspecialchars(json_encode($bill['bill_name']), ENT_QUOTES) ?> + '? This cannot be undone.');">
                                                     <input type="hidden" name="bill_id" value="<?= (int)$bill['bill_id'] ?>">
+                                                    <?= csrf_field() ?>
                                                     <button type="submit" class="btn-delete">Delete</button>
                                                 </form>
                                             </div>

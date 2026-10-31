@@ -11,6 +11,9 @@ if (!isset($_SESSION['user_id'])) {
 }
 
 require_once __DIR__ . '/config/database.php';
+require_once __DIR__ . '/includes/csrf.php';
+require_once __DIR__ . '/includes/activity.php';
+require_once __DIR__ . '/includes/budgets.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -42,6 +45,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $validCategoryIds = array_column($categories, 'category_id');
 
+    if (!csrf_valid()) {
+        $errors[] = CSRF_ERROR;
+    }
     if (strlen($billName) < 2 || strlen($billName) > 100) {
         $errors[] = 'Bill name must be between 2 and 100 characters.';
     }
@@ -51,6 +57,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $dueDateObj = DateTime::createFromFormat('Y-m-d', $dueDate);
     if (!$dueDateObj || $dueDateObj->format('Y-m-d') !== $dueDate) {
         $errors[] = 'Please enter a valid due date.';
+    } elseif ($dueDate < '2000-01-01' || $dueDate > '2100-12-31') {
+        // A recurring bill dated decades back would make the generator insert a bill per missed
+        // month on every page load; a far-future one overflows DATE_ADD. Both are typos anyway.
+        $errors[] = 'Due date must be between the years 2000 and 2100.';
     }
     if (!ctype_digit((string)$categoryId) || !in_array((int)$categoryId, $validCategoryIds, true)) {
         $errors[] = 'Please select a valid category.';
@@ -70,6 +80,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 (int)$categoryId,
                 $isRecurring ? 1 : 0,
             ]);
+
+            $userId = (int)$_SESSION['user_id'];
+            logActivity($pdo, $userId, 'bill_added', sprintf(
+                '%s — %s, due %s%s',
+                $billName,
+                activityMoney((float)$amount),
+                $dueDateObj->format('M j, Y'),
+                $isRecurring ? ' (monthly)' : ''
+            ));
+            // Shown once on bills.php if this bill pushed its category over budget.
+            $budgetWarning = budgetWarningFor($pdo, $userId, (int)$categoryId, $dueDate);
+            if ($budgetWarning !== null) {
+                $_SESSION['flash_budget_warning'] = $budgetWarning;
+            }
 
             header('Location: bills.php?added=1');
             exit;
@@ -318,12 +342,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <p>Create a new bill to track.</p>
             </div>
             <div class="topbar-right">
-                <a href="auth/logout.php" class="btn-logout">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"/>
-                    </svg>
-                    Logout
-                </a>
+                <?php require __DIR__ . '/partials/logout-button.php'; ?>
             </div>
         </header>
 
@@ -344,6 +363,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <?php endif; ?>
 
                 <form method="POST" action="" novalidate>
+                    <?= csrf_field() ?>
                     <div class="form-group">
                         <label for="bill_name">Bill Name</label>
                         <input type="text" id="bill_name" name="bill_name" placeholder="e.g. Meralco Electric Bill"

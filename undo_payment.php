@@ -17,10 +17,19 @@ if (!isset($_SESSION['user_id'])) {
 }
 
 require_once __DIR__ . '/config/database.php';
+<<<<<<< HEAD
 
 $returnTo = ($_POST['return'] ?? '') === 'payments' ? 'payments.php' : 'bills.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+=======
+require_once __DIR__ . '/includes/csrf.php';
+require_once __DIR__ . '/includes/activity.php';
+
+$returnTo = ($_POST['return'] ?? '') === 'payments' ? 'payments.php' : 'bills.php';
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !csrf_valid()) {
+>>>>>>> origin/sqa/audit-fixes-and-features
     header('Location: ' . $returnTo);
     exit;
 }
@@ -73,6 +82,11 @@ try {
     }
 
     $pdo->commit();
+
+    $nameStmt = $pdo->prepare('SELECT bill_name FROM bills WHERE bill_id = ?');
+    $nameStmt->execute([$ownedBillId]);
+    logActivity($pdo, $userId, 'payment_undone', (string)$nameStmt->fetchColumn());
+
     header('Location: ' . $returnTo . '?unpaid=1');
     exit;
 } catch (PDOException $e) {

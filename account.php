@@ -11,6 +11,8 @@ if (!isset($_SESSION['user_id'])) {
 }
 
 require_once __DIR__ . '/config/database.php';
+require_once __DIR__ . '/includes/csrf.php';
+require_once __DIR__ . '/includes/activity.php';
 
 $pdo = getPDO();
 $userId = (int)$_SESSION['user_id'];
@@ -19,9 +21,11 @@ $stmt = $pdo->prepare('SELECT id, full_name, email, created_at FROM users WHERE 
 $stmt->execute([$userId]);
 $user = $stmt->fetch();
 
-// The session points at a user that no longer exists — end it cleanly via the existing logout.
+// The session points at a user that no longer exists — end it here (logout.php is POST-only).
 if (!$user) {
-    header('Location: auth/logout.php');
+    session_unset();
+    session_destroy();
+    header('Location: auth/login.php');
     exit;
 }
 
@@ -41,6 +45,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'profi
 
     $old['full_name'] = $fullName;
     $old['email']     = $email;
+
+    if (!csrf_valid()) {
+        $profileErrors[] = CSRF_ERROR;
+    }
 
     // Same rules as auth/register.php, plus the column length limits (varchar 120 / 180).
     if (mb_strlen($fullName) < 2) {
@@ -75,6 +83,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'profi
             // The sidebar on every page reads the name from the session.
             $_SESSION['user_name'] = $fullName;
 
+            $changes = [];
+            if ($fullName !== $user['full_name']) {
+                $changes[] = 'name';
+            }
+            if ($email !== $user['email']) {
+                $changes[] = 'email (' . $user['email'] . ' → ' . $email . ')';
+            }
+            logActivity($pdo, $userId, 'profile_updated', 'Changed ' . implode(' and ', $changes));
+
             header('Location: account.php?updated=profile');
             exit;
         } catch (PDOException $e) {
@@ -95,6 +112,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'passw
     $currentPassword = $_POST['current_password'] ?? '';
     $newPassword     = $_POST['new_password'] ?? '';
     $confirmPassword = $_POST['confirm_password'] ?? '';
+
+    if (!csrf_valid()) {
+        $passwordErrors[] = CSRF_ERROR;
+    }
 
     // Re-authenticate: always verify against the hash as it is in the database right now, even
     // though the user is already logged in, so an unattended session can't change the password.
@@ -129,6 +150,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'passw
 
             // New credentials, new session id (also invalidates the old id for this browser).
             session_regenerate_id(true);
+            logActivity($pdo, $userId, 'password_changed');
 
             header('Location: account.php?updated=password');
             exit;
@@ -358,12 +380,7 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
                 <p>Manage your personal details.</p>
             </div>
             <div class="topbar-right">
-                <a href="auth/logout.php" class="btn-logout">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"/>
-                    </svg>
-                    Logout
-                </a>
+                <?php require __DIR__ . '/partials/logout-button.php'; ?>
             </div>
         </header>
 
@@ -394,6 +411,7 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
 
                 <form method="POST" action="" novalidate>
                     <input type="hidden" name="action" value="profile">
+                    <?= csrf_field() ?>
 
                     <div class="form-group">
                         <label for="full_name">Full Name</label>
@@ -441,6 +459,7 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
 
                 <form method="POST" action="" novalidate>
                     <input type="hidden" name="action" value="password">
+                    <?= csrf_field() ?>
 
                     <div class="form-group">
                         <label for="current_password">Current Password</label>

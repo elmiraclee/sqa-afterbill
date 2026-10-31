@@ -12,6 +12,8 @@ if (!isset($_SESSION['user_id'])) {
 }
 
 require_once __DIR__ . '/config/database.php';
+require_once __DIR__ . '/includes/csrf.php';
+require_once __DIR__ . '/includes/csv.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -64,21 +66,17 @@ $payments = $stmt->fetchAll();
 
 // CSV export of exactly what the current filters show.
 if (($_GET['export'] ?? '') === 'csv') {
-    $filename = 'afterbill-payments' . ($monthFilter !== '' ? '-' . $monthFilter : '') . '.csv';
-    header('Content-Type: text/csv; charset=utf-8');
-    header('Content-Disposition: attachment; filename="' . $filename . '"');
-    $out = fopen('php://output', 'w');
-    fwrite($out, "\xEF\xBB\xBF"); // BOM so Excel reads UTF-8 correctly
+    $out = csvStart('afterbill-payments' . ($monthFilter !== '' ? '-' . $monthFilter : '') . '.csv');
     fputcsv($out, ['Payment Date', 'Bill', 'Category', 'Bill Due Date', 'Amount Paid', 'Method', 'Notes']);
     foreach ($payments as $p) {
         fputcsv($out, [
             $p['payment_date'],
-            $p['bill_name'],
-            $p['category_name'],
+            csvSafe($p['bill_name']),
+            csvSafe($p['category_name']),
             $p['due_date'],
             number_format((float)$p['amount_paid'], 2, '.', ''),
             $paymentMethodLabels[$p['payment_method']],
-            $p['notes'] ?? '',
+            csvSafe($p['notes']),
         ]);
     }
     fclose($out);
@@ -130,12 +128,7 @@ $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' 
                     </svg>
                     Export CSV
                 </a>
-                <a href="auth/logout.php" class="btn-logout">
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"/>
-                    </svg>
-                    Logout
-                </a>
+                <?php require __DIR__ . '/partials/logout-button.php'; ?>
             </div>
         </header>
 
@@ -226,6 +219,10 @@ $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' 
                                                 onsubmit="return confirm('Remove this payment? The bill will go back to unpaid.');">
                                                 <input type="hidden" name="payment_id" value="<?= (int)$p['payment_id'] ?>">
                                                 <input type="hidden" name="return" value="payments">
+<<<<<<< HEAD
+=======
+                                                <?= csrf_field() ?>
+>>>>>>> origin/sqa/audit-fixes-and-features
                                                 <button type="submit" class="btn-outline red">Undo</button>
                                             </form>
                                         </td>

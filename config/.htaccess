@@ -1,0 +1,2 @@
+# Server-side code / data only — never served over HTTP (PHP pages include these from disk).
+Require all denied

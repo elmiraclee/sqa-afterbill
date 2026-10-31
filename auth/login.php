@@ -12,6 +12,8 @@ if (isset($_SESSION['user_id'])) {
 }
 
 require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/csrf.php';
+require_once __DIR__ . '/../includes/activity.php';
 
 $errors = [];
 $old_email = '';
@@ -21,6 +23,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $password = $_POST['password'] ?? '';
     $old_email = $email;
 
+    if (!csrf_valid()) {
+        $errors[] = CSRF_ERROR;
+    }
     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $errors[] = 'Please enter a valid email address.';
     }
@@ -35,12 +40,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmt->execute([$email]);
             $user = $stmt->fetch();
 
-            if ($user && password_verify($password, $user['password'])) {
+            // Brute-force guard: a locked account is refused before the password is even checked,
+            // and attempts during the lock are not logged, so the lock ends on time.
+            $lockMinutes = $user ? loginLockMinutesLeft($pdo, (int)$user['id']) : 0;
+
+            if ($lockMinutes > 0) {
+                $errors[] = 'Too many failed login attempts. Please wait ' . $lockMinutes
+                    . ' minute' . ($lockMinutes === 1 ? '' : 's') . ' and try again.';
+            } elseif ($user && password_verify($password, $user['password'])) {
+                // New session id on privilege change, so a session id planted before login
+                // (session fixation) is useless afterwards.
+                session_regenerate_id(true);
                 $_SESSION['user_id']   = $user['id'];
                 $_SESSION['user_name'] = $user['full_name'];
+                logActivity($pdo, (int)$user['id'], 'login');
                 header('Location: ../dashboard.php');
                 exit;
             } else {
+                // Recorded on the account that was targeted, so its owner can see attempts.
+                if ($user) {
+                    logActivity($pdo, (int)$user['id'], 'login_failed');
+                }
                 $errors[] = 'Invalid email or password.';
             }
         } catch (PDOException $e) {
@@ -199,6 +219,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <?php endif; ?>
 
                     <form method="POST" action="" novalidate>
+                        <?= csrf_field() ?>
                         <div class="form-group">
                             <label for="email">Email Address</label>
                             <div class="input-wrapper">

@@ -1,0 +1,37 @@
+# AfterBill — web server hardening (Apache; XAMPP allows .htaccess overrides in htdocs)
+
+# No folder listings.
+Options -Indexes
+
+# Anything starting with a dot is never part of the website (.git, .vscode, .snapshots, ...).
+RedirectMatch 404 /\.[^/]+(/|$)
+
+# Project notes, test output, SQL, logs and editor/config data are not web pages.
+<FilesMatch "\.(md|txt|sql|log|json|ini|bak|lock)$">
+    Require all denied
+</FilesMatch>
+
+<IfModule mod_headers.c>
+    # Clickjacking: no other site may show AfterBill pages in a frame.
+    Header always set X-Frame-Options "DENY"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy "same-origin"
+    # Don't advertise the PHP version.
+    Header always unset X-Powered-By
+    Header unset X-Powered-By
+</IfModule>
+
+<IfModule php_module>
+    # Errors go to the server log, never to the visitor's screen (they contain server paths).
+    php_flag display_errors Off
+    php_flag log_errors On
+
+    # Session cookie: not readable by JavaScript, not sent on cross-site requests,
+    # and session ids the server never issued are rejected.
+    php_flag session.cookie_httponly On
+    php_value session.cookie_samesite Lax
+    php_flag session.use_strict_mode On
+
+    # One clock for the whole app (config/database.php aligns MySQL to the same offset).
+    php_value date.timezone "Asia/Manila"
+</IfModule>
