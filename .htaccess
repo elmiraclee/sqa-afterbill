@@ -6,6 +6,10 @@ Options -Indexes
 # Anything starting with a dot is never part of the website (.git, .vscode, .snapshots, ...).
 RedirectMatch 404 /\.[^/]+(/|$)
 
+# Composer packages (vendor/ is git-ignored and rebuilt by `composer install`, so it can't carry
+# its own .htaccess like includes/ does). Library files are not pages.
+RedirectMatch 404 /vendor(/|$)
+
 # Project notes, test output, SQL, logs and editor/config data are not web pages.
 <FilesMatch "\.(md|txt|sql|log|json|ini|bak|lock)$">
     Require all denied
@@ -16,6 +20,13 @@ RedirectMatch 404 /\.[^/]+(/|$)
     Header always set X-Frame-Options "DENY"
     Header always set X-Content-Type-Options "nosniff"
     Header always set Referrer-Policy "same-origin"
+
+    # Content-Security-Policy: the browser only runs script FILES from this site, so even if
+    # someone managed to inject <script> or onclick="..." into a page, it would not execute.
+    # (Page behavior lives in assets/js/*.js; inline handlers are replaced by data attributes,
+    # see assets/js/app.js.) Inline styles stay allowed: they can't run code. Fonts come from
+    # Google Fonts; images are local or data: URIs (favicon). Forms may only post to this site.
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     # Don't advertise the PHP version.
     Header always unset X-Powered-By
     Header unset X-Powered-By

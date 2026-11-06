@@ -3,21 +3,19 @@
  * AfterBill - Account Management
  */
 
-session_start();
-
-if (!isset($_SESSION['user_id'])) {
-    header('Location: auth/login.php');
-    exit;
-}
+require_once __DIR__ . '/includes/auth.php';
+require_login(); // session check, idle timeout, sign-out after a password change
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/csrf.php';
 require_once __DIR__ . '/includes/activity.php';
+require_once __DIR__ . '/includes/password_policy.php';
+require_once __DIR__ . '/includes/auth_tokens.php';
 
 $pdo = getPDO();
 $userId = (int)$_SESSION['user_id'];
 
-$stmt = $pdo->prepare('SELECT id, full_name, email, created_at FROM users WHERE id = ? LIMIT 1');
+$stmt = $pdo->prepare('SELECT id, full_name, email, password, created_at FROM users WHERE id = ? LIMIT 1');
 $stmt->execute([$userId]);
 $user = $stmt->fetch();
 
@@ -63,6 +61,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'profi
         $profileErrors[] = 'Email must be 180 characters or fewer.';
     }
 
+    // The email is the login, so changing it needs the current password: otherwise anyone at an
+    // unattended, signed-in computer could take the account over. Checked before the uniqueness
+    // check, so the form can't be used to probe which emails are registered.
+    $emailChanged = strcasecmp($email, $user['email']) !== 0;
+    if (empty($profileErrors) && $emailChanged) {
+        $profilePassword = $_POST['current_password'] ?? '';
+        if ($profilePassword === '') {
+            $profileErrors[] = 'Enter your current password to change your email address.';
+        } elseif (!password_verify($profilePassword, $user['password'])) {
+            $profileErrors[] = 'Current password is incorrect.';
+        }
+    }
+
     // Friendly uniqueness check. "id != ?" so keeping your own email is never a conflict; the
     // column collation is case-insensitive, so Name@x.com and name@x.com count as the same.
     if (empty($profileErrors)) {
@@ -77,22 +88,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'profi
         $profileNotice = 'No changes to save.';
     } elseif (empty($profileErrors)) {
         try {
+            // The name changes now. A new email only takes effect once a link sent TO it is opened
+            // (auth/verify_email.php), so the account never switches to an address nobody can read.
+            // A different capitalisation of the same address is just saved.
+            $saveEmail = $emailChanged ? $user['email'] : $email;
             $update = $pdo->prepare('UPDATE users SET full_name = ?, email = ? WHERE id = ?');
-            $update->execute([$fullName, $email, $userId]);
+            $update->execute([$fullName, $saveEmail, $userId]);
 
             // The sidebar on every page reads the name from the session.
             $_SESSION['user_name'] = $fullName;
 
-            $changes = [];
             if ($fullName !== $user['full_name']) {
-                $changes[] = 'name';
+                logActivity($pdo, $userId, 'profile_updated', 'Changed name');
             }
-            if ($email !== $user['email']) {
-                $changes[] = 'email (' . $user['email'] . ' → ' . $email . ')';
+            $query = 'updated=profile';
+            if ($emailChanged) {
+                send_email_change_emails($pdo, $userId, $fullName, $user['email'], $email);
+                $_SESSION['pending_email'] = $email;
+                $query = 'updated=email_pending';
             }
-            logActivity($pdo, $userId, 'profile_updated', 'Changed ' . implode(' and ', $changes));
 
-            header('Location: account.php?updated=profile');
+            header('Location: account.php?' . $query);
             exit;
         } catch (PDOException $e) {
             // Backstop for two people claiming the same email at the same moment: the UNIQUE
@@ -129,13 +145,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'passw
         $passwordErrors[] = 'Current password is incorrect.';
     }
 
-    // Same minimum as auth/register.php. The 72-byte cap is bcrypt's limit: anything longer
-    // would be silently truncated by password_hash(), so it is rejected instead.
-    if (strlen($newPassword) < 8) {
-        $passwordErrors[] = 'New password must be at least 8 characters.';
-    } elseif (strlen($newPassword) > 72) {
-        $passwordErrors[] = 'New password must be 72 characters or fewer.';
-    }
+    // Same strength rules as auth/register.php (includes/password_policy.php).
+    $passwordErrors = array_merge($passwordErrors,
+        password_policy_errors($newPassword, 'New password', [$user['full_name'], $user['email']]));
     if ($newPassword !== $confirmPassword) {
         $passwordErrors[] = 'New passwords do not match.';
     }
@@ -145,17 +157,57 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'passw
 
     if (empty($passwordErrors)) {
         try {
+            $newHash = password_hash($newPassword, PASSWORD_DEFAULT);
             $update = $pdo->prepare('UPDATE users SET password = ? WHERE id = ?');
-            $update->execute([password_hash($newPassword, PASSWORD_DEFAULT), $userId]);
+            $update->execute([$newHash, $userId]);
 
-            // New credentials, new session id (also invalidates the old id for this browser).
-            session_regenerate_id(true);
+            // New session id + new password fingerprint for THIS browser. Every other session
+            // still holds the old fingerprint, so require_login() signs them out (includes/auth.php).
+            auth_login_session($userId, (string)$_SESSION['user_name'], $newHash);
             logActivity($pdo, $userId, 'password_changed');
 
             header('Location: account.php?updated=password');
             exit;
         } catch (PDOException $e) {
             $passwordErrors[] = 'Could not change your password. Please try again later.';
+        }
+    }
+}
+
+$deleteErrors = [];
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delete_account') {
+    $deletePassword = $_POST['delete_password'] ?? '';
+
+    if (!csrf_valid()) {
+        $deleteErrors[] = CSRF_ERROR;
+    } elseif ($deletePassword === '') {
+        $deleteErrors[] = 'Enter your password to delete your account.';
+    } elseif (!password_verify($deletePassword, $user['password'])) {
+        $deleteErrors[] = 'Password is incorrect. Your account was not deleted.';
+    } elseif (($_POST['confirm_delete'] ?? '') !== 'yes') {
+        $deleteErrors[] = 'Tick the box to confirm that you understand this cannot be undone.';
+    }
+
+    if (empty($deleteErrors)) {
+        try {
+            // Everything the user owns goes with the row: bills (→ payments), budgets and the
+            // activity log all reference users with ON DELETE CASCADE. Recurring-bill links are
+            // cleared first so MySQL never has to cascade through a bill that points at another
+            // bill being deleted in the same statement.
+            $pdo->beginTransaction();
+            $pdo->prepare('UPDATE bills SET parent_bill_id = NULL WHERE user_id = ?')->execute([$userId]);
+            $pdo->prepare('DELETE FROM users WHERE id = ?')->execute([$userId]);
+            $pdo->commit();
+
+            auth_end_session('deleted');
+            header('Location: auth/login.php?reason=deleted');
+            exit;
+        } catch (PDOException $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            $deleteErrors[] = 'Could not delete your account. Please try again later.';
         }
     }
 }
@@ -329,7 +381,24 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
 
         .form-group input:focus { outline: none; border-color: var(--electric-blue); }
 
+        /* Live password rules (includes/password_policy.php + assets/js/password-rules.js) */
+        .pw-rules { list-style: none; margin-top: 8px; display: grid; gap: 3px; }
+        .pw-rules li { font-size: 0.75rem; color: var(--text-muted); padding-left: 18px; position: relative; }
+        .pw-rules li::before { content: '○'; position: absolute; left: 2px; }
+        .pw-rules li.met { color: #059669; }
+        .pw-rules li.met::before { content: '✓'; font-weight: 700; }
+
         .form-actions { display: flex; gap: 12px; }
+
+        .danger-panel { border-color: #FECACA; }
+        .danger-panel h1 { color: #B91C1C; }
+        .confirm-check { display: flex; gap: 8px; align-items: flex-start; font-size: 0.82rem; color: var(--text-dark); margin-bottom: 18px; cursor: pointer; }
+        .confirm-check input { margin-top: 2px; }
+        .btn-danger {
+            padding: 10px 20px; border: none; border-radius: 8px; background: var(--danger); color: #fff;
+            font-size: 0.88rem; font-weight: 600; font-family: inherit; cursor: pointer;
+        }
+        .btn-danger:hover { background: #DC2626; }
 
         .btn-primary {
             display: inline-flex;
@@ -392,6 +461,12 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
 
                 <?php if (($_GET['updated'] ?? '') === 'profile'): ?>
                     <div class="alert alert-success">Profile updated successfully.</div>
+                <?php elseif (($_GET['updated'] ?? '') === 'email_pending'): ?>
+                    <div class="alert alert-success">
+                        Almost done: we sent a confirmation link to
+                        <strong><?= htmlspecialchars($_SESSION['pending_email'] ?? 'your new address') ?></strong>.
+                        Your email changes once you open it. Until then, keep using <?= htmlspecialchars($user['email']) ?>.
+                    </div>
                 <?php endif; ?>
 
                 <?php if ($profileNotice !== ''): ?>
@@ -423,6 +498,12 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
                         <label for="email">Email Address</label>
                         <input type="email" id="email" name="email" maxlength="180"
                             value="<?= htmlspecialchars($old['email']) ?>" required autocomplete="email">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="profile_current_password">Current Password <span style="font-weight:400;color:var(--text-muted);">(only needed to change your email)</span></label>
+                        <input type="password" id="profile_current_password" name="current_password"
+                            autocomplete="current-password">
                     </div>
 
                     <div class="form-actions">
@@ -471,6 +552,7 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
                         <label for="new_password">New Password</label>
                         <input type="password" id="new_password" name="new_password"
                             required minlength="8" maxlength="72" autocomplete="new-password">
+                        <?= password_rules_checklist('new_password') ?>
                     </div>
 
                     <div class="form-group">
@@ -490,8 +572,46 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
                 </form>
             </div>
 
+            <div class="form-panel danger-panel" id="delete-account">
+                <h1>Delete Account</h1>
+                <p>Permanently delete your account and everything in it: all bills, payments, budgets and your activity log. This cannot be undone.</p>
+
+                <?php if (!empty($deleteErrors)): ?>
+                    <div class="alert alert-error">
+                        <ul>
+                            <?php foreach ($deleteErrors as $err): ?>
+                                <li><?= htmlspecialchars($err) ?></li>
+                            <?php endforeach; ?>
+                        </ul>
+                    </div>
+                <?php endif; ?>
+
+                <form method="POST" action="#delete-account" novalidate
+                    data-confirm="Delete your AfterBill account and all of its data permanently? This cannot be undone.">
+                    <input type="hidden" name="action" value="delete_account">
+                    <?= csrf_field() ?>
+
+                    <div class="form-group">
+                        <label for="delete_password">Password</label>
+                        <input type="password" id="delete_password" name="delete_password"
+                            required autocomplete="current-password">
+                    </div>
+
+                    <label class="confirm-check">
+                        <input type="checkbox" name="confirm_delete" value="yes" required>
+                        I understand my account and all of its data will be permanently deleted.
+                    </label>
+
+                    <div class="form-actions">
+                        <button type="submit" class="btn-danger">Delete My Account</button>
+                    </div>
+                </form>
+            </div>
+
         </main>
     </div>
 </div>
+    <script src="assets/js/app.js?v=<?= filemtime(__DIR__ . '/assets/js/app.js') ?>"></script>
+    <script src="assets/js/password-rules.js?v=<?= filemtime(__DIR__ . '/assets/js/password-rules.js') ?>"></script>
 </body>
 </html>

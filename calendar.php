@@ -3,12 +3,8 @@
  * AfterBill - Calendar View
  */
 
-session_start();
-
-if (!isset($_SESSION['user_id'])) {
-    header('Location: auth/login.php');
-    exit;
-}
+require_once __DIR__ . '/includes/auth.php';
+require_login(); // session check, idle timeout, sign-out after a password change
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/recurring_bills.php';
@@ -514,41 +510,6 @@ $calendarWeeks = array_chunk($calendarCells, 7);
     </div>
 </div>
 
-<script>
-    // Position a day's popup (fixed-position, so it isn't clipped by .panel's
-    // overflow: hidden) at open time: below/left-aligned to the clicked cell by default,
-    // flipped above and/or right-aligned if that would overflow the viewport. Measured
-    // fresh on every open, not assumed from row/column position, so it works regardless
-    // of how many weeks the month has or which cell was clicked.
-    var OPEN_MARGIN = 6;
-
-    document.querySelectorAll('.calendar-day').forEach(function (day) {
-        if (day.tagName !== 'DETAILS') return;
-        day.addEventListener('toggle', function () {
-            if (!day.open) return;
-            var summary = day.querySelector('summary');
-            var popup = day.querySelector('.day-popup');
-            if (!summary || !popup) return;
-
-            var cellRect = summary.getBoundingClientRect();
-            var popupHeight = popup.offsetHeight;
-            var popupWidth = popup.offsetWidth;
-
-            var top = cellRect.bottom + OPEN_MARGIN;
-            if (top + popupHeight > window.innerHeight) {
-                top = cellRect.top - popupHeight - OPEN_MARGIN;
-            }
-
-            var left = cellRect.left;
-            if (left + popupWidth > window.innerWidth) {
-                left = cellRect.right - popupWidth;
-            }
-            if (left < 0) left = OPEN_MARGIN;
-
-            popup.style.top = top + 'px';
-            popup.style.left = left + 'px';
-        });
-    });
-</script>
+<script src="assets/js/calendar.js?v=<?= filemtime(__DIR__ . '/assets/js/calendar.js') ?>"></script>
 </body>
 </html>

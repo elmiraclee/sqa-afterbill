@@ -4,18 +4,21 @@
  * Uses PHP PDO
  */
 
-session_start();
+require_once __DIR__ . '/../includes/auth.php';
 
-if (isset($_SESSION['user_id'])) {
+if (auth_check()) {
     header('Location: ../dashboard.php');
     exit;
 }
 
-require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/csrf.php';
 require_once __DIR__ . '/../includes/activity.php';
+require_once __DIR__ . '/../includes/rate_limit.php';
 
 $errors = [];
+$needsVerification = false;
+// Why the user was signed out (session ended here, or by require_login() on another page).
+$notice = auth_end_message($GLOBALS['auth_end_reason'] ?? ($_GET['reason'] ?? null));
 $old_email = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -36,23 +39,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (empty($errors)) {
         try {
             $pdo = getPDO();
-            $stmt = $pdo->prepare('SELECT id, full_name, password FROM users WHERE email = ? LIMIT 1');
+            $stmt = $pdo->prepare('SELECT id, full_name, password, email_verified_at FROM users WHERE email = ? LIMIT 1');
             $stmt->execute([$email]);
             $user = $stmt->fetch();
 
-            // Brute-force guard: a locked account is refused before the password is even checked,
-            // and attempts during the lock are not logged, so the lock ends on time.
+            // Brute-force guards, checked before the password: too many failures from this IP
+            // (any emails), or on this account. Attempts during a lock are not counted, so it
+            // ends on time. The IP message is the same for known and unknown emails.
+            $ipMinutes   = rate_limit_minutes_left($pdo, 'login_failed');
             $lockMinutes = $user ? loginLockMinutesLeft($pdo, (int)$user['id']) : 0;
 
-            if ($lockMinutes > 0) {
+            if ($ipMinutes > 0) {
+                $errors[] = rate_limit_message($ipMinutes);
+            } elseif ($lockMinutes > 0) {
                 $errors[] = 'Too many failed login attempts. Please wait ' . $lockMinutes
                     . ' minute' . ($lockMinutes === 1 ? '' : 's') . ' and try again.';
+            } elseif ($user && password_verify($password, $user['password']) && $user['email_verified_at'] === null) {
+                // Checked only after the password, so this can't be used to probe accounts.
+                $errors[] = 'Please verify your email address first: open the link we emailed you when you registered.';
+                $needsVerification = true;
             } elseif ($user && password_verify($password, $user['password'])) {
-                // New session id on privilege change, so a session id planted before login
-                // (session fixation) is useless afterwards.
-                session_regenerate_id(true);
-                $_SESSION['user_id']   = $user['id'];
-                $_SESSION['user_name'] = $user['full_name'];
+                // New session id (session fixation guard) + password fingerprint (includes/auth.php).
+                auth_login_session((int)$user['id'], $user['full_name'], $user['password']);
                 logActivity($pdo, (int)$user['id'], 'login');
                 header('Location: ../dashboard.php');
                 exit;
@@ -61,6 +69,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($user) {
                     logActivity($pdo, (int)$user['id'], 'login_failed');
                 }
+                rate_limit_hit($pdo, 'login_failed');
                 $errors[] = 'Invalid email or password.';
             }
         } catch (PDOException $e) {
@@ -79,7 +88,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="../assets/css/auth.css">
+    <link rel="stylesheet" href="../assets/css/auth.css?v=<?= filemtime(__DIR__ . '/../assets/css/auth.css') ?>">
 </head>
 <body>
     <div class="auth-page">
@@ -208,6 +217,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <p>Sign in to your account</p>
                     </div>
 
+                    <?php if ($notice !== '' && empty($errors)): ?>
+                        <div class="alert alert-success"><?= htmlspecialchars($notice) ?></div>
+                    <?php endif; ?>
+
                     <?php if (!empty($errors)): ?>
                         <div class="alert alert-error">
                             <ul>
@@ -215,6 +228,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     <li><?= htmlspecialchars($err) ?></li>
                                 <?php endforeach; ?>
                             </ul>
+                            <?php if ($needsVerification): ?>
+                                <p style="margin-top:6px;"><a href="resend_verification.php">Send me a new verification link</a></p>
+                            <?php endif; ?>
                         </div>
                     <?php endif; ?>
 
@@ -250,6 +266,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 </button>
                             </div>
                         </div>
+
+                        <div class="forgot-link"><a href="forgot_password.php">Forgot password?</a></div>
 
                         <button type="submit" class="btn-primary">
                             Sign In

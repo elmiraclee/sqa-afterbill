@@ -49,8 +49,8 @@ document.addEventListener('DOMContentLoaded', function () {
             valid = false;
         }
 
-        if (password.length < 8) {
-            showFieldError('password', 'Password must be at least 8 characters.');
+        if (!window.passwordMeetsRules || !window.passwordMeetsRules('password', password)) {
+            showFieldError('password', 'Password does not meet all the requirements below.');
             valid = false;
         }
 

@@ -4,12 +4,8 @@
  * Overdue, due-today and upcoming unpaid bills within a chosen reminder window.
  */
 
-session_start();
-
-if (!isset($_SESSION['user_id'])) {
-    header('Location: auth/login.php');
-    exit;
-}
+require_once __DIR__ . '/includes/auth.php';
+require_login(); // session check, idle timeout, sign-out after a password change
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/recurring_bills.php';
@@ -140,7 +136,7 @@ if ($groups['upcoming']['rows']) {
                     </nav>
                 </div>
                 <div>
-                    <button type="button" id="notifyBtn" class="btn-outline blue">Enable desktop alerts</button>
+                    <button type="button" id="notifyBtn" class="btn-outline blue" data-summary="<?= htmlspecialchars(implode(', ', $notifyText)) ?>">Enable desktop alerts</button>
                     <span id="notifyStatus"></span>
                 </div>
             </div>
@@ -215,49 +211,6 @@ if ($groups['upcoming']['rows']) {
     </div>
 </div>
 
-<script>
-(function () {
-    var summary = <?= json_encode(implode(', ', $notifyText)) ?>;
-    var btn = document.getElementById('notifyBtn');
-    var status = document.getElementById('notifyStatus');
-
-    if (!('Notification' in window)) {
-        btn.style.display = 'none';
-        return;
-    }
-
-    function notify() {
-        if (summary) {
-            new Notification('AfterBill reminders', { body: 'You have ' + summary + '.' });
-        }
-    }
-
-    function refresh() {
-        if (Notification.permission === 'granted') {
-            btn.style.display = 'none';
-            status.textContent = 'Desktop alerts are on.';
-        } else if (Notification.permission === 'denied') {
-            btn.style.display = 'none';
-            status.textContent = 'Desktop alerts are blocked in your browser settings.';
-        }
-    }
-
-    btn.addEventListener('click', function () {
-        Notification.requestPermission().then(function (p) {
-            refresh();
-            if (p === 'granted') notify();
-        });
-    });
-
-    refresh();
-    // Once per browser session, so navigating back here doesn't spam alerts.
-    try {
-        if (Notification.permission === 'granted' && !sessionStorage.getItem('abNotified')) {
-            sessionStorage.setItem('abNotified', '1');
-            notify();
-        }
-    } catch (e) {}
-})();
-</script>
+<script src="assets/js/reminders.js?v=<?= filemtime(__DIR__ . '/assets/js/reminders.js') ?>"></script>
 </body>
 </html>

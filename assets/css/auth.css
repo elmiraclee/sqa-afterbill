@@ -412,6 +412,22 @@ html, body {
     height: 15px;
 }
 
+.forgot-link {
+    text-align: right;
+    margin: -6px 0 14px;
+    font-size: 0.78rem;
+}
+
+.forgot-link a {
+    color: var(--electric-blue);
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.forgot-link a:hover {
+    text-decoration: underline;
+}
+
 .form-footer {
     text-align: center;
     margin-top: 18px;
@@ -461,6 +477,37 @@ html, body {
     font-size: 0.72rem;
     color: var(--error);
     margin-top: 4px;
+}
+
+/* Live password rules (includes/password_policy.php + assets/js/password-rules.js) */
+.pw-rules {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: grid;
+    gap: 3px;
+}
+
+.pw-rules li {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    padding-left: 18px;
+    position: relative;
+}
+
+.pw-rules li::before {
+    content: '○';
+    position: absolute;
+    left: 2px;
+}
+
+.pw-rules li.met {
+    color: #059669;
+}
+
+.pw-rules li.met::before {
+    content: '✓';
+    font-weight: 700;
 }
 
 @media (max-width: 800px) {

@@ -20,6 +20,8 @@ const ACTIVITY_TYPES = [
     'payment_undone'   => ['Payment undone',    'amber', 'payments'],
     'profile_updated'  => ['Profile updated',   'blue',  'account'],
     'password_changed' => ['Password changed',  'amber', 'account'],
+    'password_reset'   => ['Password reset',    'amber', 'account'],
+    'email_verified'   => ['Email verified',    'green', 'account'],
     'budget_set'       => ['Budget set',        'blue',  'budgets'],
     'budget_removed'   => ['Budget removed',    'gray',  'budgets'],
 ];

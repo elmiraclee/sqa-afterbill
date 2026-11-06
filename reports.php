@@ -3,12 +3,8 @@
  * AfterBill - Monthly Reports
  */
 
-session_start();
-
-if (!isset($_SESSION['user_id'])) {
-    header('Location: auth/login.php');
-    exit;
-}
+require_once __DIR__ . '/includes/auth.php';
+require_login(); // session check, idle timeout, sign-out after a password change
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/recurring_bills.php';

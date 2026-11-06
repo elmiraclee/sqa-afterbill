@@ -3,10 +3,16 @@
  * AfterBill - Database Configuration (PDO)
  */
 
-define('DB_HOST', 'localhost');
-define('DB_NAME', 'afterbill');
-define('DB_USER', 'root');
-define('DB_PASS', ''); // XAMPP default
+// Server-specific credentials live in config/database.local.php (git-ignored, never committed):
+// the hosting server has its own copy. Without it, the XAMPP defaults below are used.
+// Template: config/database.local.example.php
+if (is_file(__DIR__ . '/database.local.php')) {
+    require __DIR__ . '/database.local.php';
+}
+defined('DB_HOST') || define('DB_HOST', 'localhost');
+defined('DB_NAME') || define('DB_NAME', 'afterbill');
+defined('DB_USER') || define('DB_USER', 'root');
+defined('DB_PASS') || define('DB_PASS', ''); // XAMPP default
 define('DB_CHARSET', 'utf8mb4');
 
 // One clock for the whole app. PHP (date(), DateTime) and MySQL (CURDATE(), NOW()) must agree on

@@ -4,19 +4,22 @@
  * Uses PHP PDO
  */
 
-session_start();
+require_once __DIR__ . '/../includes/auth.php';
 
-if (isset($_SESSION['user_id'])) {
+if (auth_check()) {
     header('Location: ../dashboard.php');
     exit;
 }
 
-require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/csrf.php';
+require_once __DIR__ . '/../includes/rate_limit.php';
+require_once __DIR__ . '/../includes/auth_tokens.php';
 require_once __DIR__ . '/../includes/activity.php';
+require_once __DIR__ . '/../includes/password_policy.php';
 
 $errors = [];
 $success = false;
+$mailSent = true;
 $old = [
     'full_name' => '',
     'email'     => '',
@@ -35,6 +38,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!csrf_valid()) {
         $errors[] = CSRF_ERROR;
     }
+    // Per-IP limit on registration attempts (account spam, probing which emails exist).
+    $regMinutes = rate_limit_minutes_left(getPDO(), 'register');
+    if ($regMinutes > 0) {
+        $errors[] = rate_limit_message($regMinutes);
+    } else {
+        rate_limit_hit(getPDO(), 'register');
+    }
     // Length limits match the users columns (varchar 120 / 180) and account.php, so nothing is
     // silently truncated by the database.
     if (mb_strlen($fullName) < 2) {
@@ -47,12 +57,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } elseif (mb_strlen($email) > 180) {
         $errors[] = 'Email must be 180 characters or fewer.';
     }
-    // 72 bytes is bcrypt's limit: password_hash() would silently ignore anything past it.
-    if (strlen($password) < 8) {
-        $errors[] = 'Password must be at least 8 characters.';
-    } elseif (strlen($password) > 72) {
-        $errors[] = 'Password must be 72 characters or fewer.';
-    }
+    // Strength rules (length, uppercase, number, special character, 72-byte bcrypt cap).
+    $errors = array_merge($errors, password_policy_errors($password, 'Password', [$fullName, $email]));
     if ($password !== $confirm) {
         $errors[] = 'Passwords do not match.';
     }
@@ -82,14 +88,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
             $stmt->execute([$fullName, $email, $hashed]);
 
-            // Auto-login: set session and redirect to dashboard
-            $newId = $pdo->lastInsertId();
-            session_regenerate_id(true); // same session-fixation guard as login.php
-            $_SESSION['user_id']   = $newId;
-            $_SESSION['user_name'] = $fullName;
-            logActivity($pdo, (int)$newId, 'register');
-            header('Location: ../dashboard.php');
-            exit;
+            // No auto-login: the account can't be used until the emailed link is opened
+            // (auth/verify_email.php), which proves the address belongs to this person.
+            $newId = (int)$pdo->lastInsertId();
+            logActivity($pdo, $newId, 'register');
+            $mailSent = send_verification_email($pdo, $newId, $fullName, $email);
+            $success = true;
         } catch (PDOException $e) {
             $errors[] = 'Registration failed. Please try again later.';
         }
@@ -106,7 +110,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="../assets/css/auth.css">
+    <link rel="stylesheet" href="../assets/css/auth.css?v=<?= filemtime(__DIR__ . '/../assets/css/auth.css') ?>">
 </head>
 <body>
     <div class="auth-page">
@@ -239,7 +243,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     <?php if ($success): ?>
                         <div class="alert alert-success">
-                            Account created successfully! You can now <a href="login.php">log in</a>.
+                            <strong>Almost done! Check your inbox.</strong><br>
+                            We sent a verification link to <?= htmlspecialchars($old['email']) ?>.
+                            Open it to activate your account, then <a href="login.php">log in</a>.
+                            The link expires in 24 hours.
+                            <?php if (!$mailSent): ?>
+                                <br><br>We couldn't send the email just now. <a href="resend_verification.php">Try sending it again</a>.
+                            <?php endif; ?>
                         </div>
                     <?php endif; ?>
 
@@ -286,7 +296,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
                                 </svg>
                                 <input type="password" id="password" name="password" placeholder="Create a password"
-                                    required minlength="8" autocomplete="new-password">
+                                    required minlength="8" maxlength="72" autocomplete="new-password">
                                 <button type="button" class="toggle-password" aria-label="Toggle password">
                                     <svg class="eye-open" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" />
@@ -297,6 +307,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     </svg>
                                 </button>
                             </div>
+                            <?= password_rules_checklist('password') ?>
                         </div>
 
                         <div class="form-group">
@@ -343,6 +354,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 
-    <script src="../assets/js/register.js"></script>
+    <script src="../assets/js/password-rules.js?v=<?= filemtime(__DIR__ . '/../assets/js/password-rules.js') ?>"></script>
+    <script src="../assets/js/register.js?v=<?= filemtime(__DIR__ . '/../assets/js/register.js') ?>"></script>
 </body>
 </html>

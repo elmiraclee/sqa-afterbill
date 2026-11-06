@@ -17,6 +17,10 @@ if (PHP_SAPI !== 'cli') {
 
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/budgets.php';
+require_once __DIR__ . '/../includes/password_policy.php';
+require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/../includes/rate_limit.php';
+require_once __DIR__ . '/../config/mail.php';
 
 $BASE = rtrim($argv[1] ?? 'http://localhost/sqa_afterbill', '/');
 $pdo = getPDO();
@@ -34,6 +38,8 @@ foreach (['C:/xampp/php/logs/php_error_log', 'C:/xampp/apache/logs/error.log'] a
 final class Client
 {
     public array $cookies = [];
+    /** Extra raw request headers, e.g. ['Host: evil.example']. */
+    public array $headers = [];
 
     public function __construct(private string $base)
     {
@@ -49,6 +55,9 @@ final class Client
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_TIMEOUT        => 30,
         ]);
+        if ($this->headers) {
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $this->headers);
+        }
         if ($this->cookies) {
             $pairs = [];
             foreach ($this->cookies as $k => $v) {
@@ -123,6 +132,7 @@ function group(string $name): void
 function check(string $id, string $name, callable $fn): void
 {
     global $results, $currentGroup;
+    clearRateLimits();
     try {
         $msg = $fn();
         $ok = $msg === true || $msg === null;
@@ -150,17 +160,80 @@ function phpErrorsIn(string $body): ?string
 }
 
 $stamp = date('YmdHis') . random_int(100, 999);
-$PASS = 'AuditPass#2026';
+$PASS = 'Harbor#Lights26';
 
-function registerUser(Client $c, string $name, string $email, string $pass): array
+/** The suite makes far more logins/registrations from localhost than the per-IP limits allow. */
+function clearRateLimits(): void
 {
-    return $c->post('auth/register.php', [
+    try {
+        getPDO()->exec("DELETE FROM rate_limits WHERE ip IN ('127.0.0.1', '::1')");
+    } catch (PDOException $e) {
+        // migration 002 not run: there are no limits to clear
+    }
+}
+
+/**
+ * Registers like a real user: submits the form, opens the verification link from the email,
+ * then logs in on the same client. Returns the registration response. With $verify = false it
+ * stops after the form (the account stays unverified and signed out).
+ */
+function registerUser(Client $c, string $name, string $email, string $pass, bool $verify = true): array
+{
+    $mark = mailMark();
+    $r = $c->post('auth/register.php', [
         'full_name'        => $name,
         'email'            => $email,
         'password'         => $pass,
         'confirm_password' => $pass,
         'terms'            => 'on',
     ]);
+    if ($verify && ($link = mailLink($email, 'auth/verify_email.php', $mark)) !== null) {
+        $c->get($link);
+        login($c, $email, $pass);
+    }
+    return $r;
+}
+
+// ---- Emails: the app's "log" mail driver writes one JSON line per email (config/mail.php).
+// Addresses ending in .test always go there, even when real SMTP is configured.
+
+/** Current end of the mail log: pass to mailsTo()/mailLink() to see only newer emails. */
+function mailMark(): int
+{
+    global $MAIL_CONFIG;
+    clearstatcache();
+    return is_file($MAIL_CONFIG['log_file']) ? filesize($MAIL_CONFIG['log_file']) : 0;
+}
+
+/** @return array<int, array{to:string, subject:string, body:string}> emails to $to written after $mark */
+function mailsTo(string $to, int $mark = 0): array
+{
+    global $MAIL_CONFIG;
+    clearstatcache();
+    if (!is_file($MAIL_CONFIG['log_file'])) {
+        return [];
+    }
+    $out = [];
+    foreach (explode("\n", (string)file_get_contents($MAIL_CONFIG['log_file'], false, null, $mark)) as $line) {
+        $m = json_decode($line, true);
+        if (is_array($m) && strcasecmp($m['to'], $to) === 0) {
+            $out[] = $m;
+        }
+    }
+    return $out;
+}
+
+/** Path (relative to the app) of the newest emailed link to $page for $to, or null. */
+function mailLink(string $to, string $page, int $mark = 0): ?string
+{
+    global $MAIL_CONFIG;
+    $prefix = rtrim($MAIL_CONFIG['app_url'], '/') . '/';
+    foreach (array_reverse(mailsTo($to, $mark)) as $m) {
+        if (preg_match('#' . preg_quote($prefix . $page, '#') . '\?token=[0-9a-f]{64}#', $m['body'], $x)) {
+            return substr($x[0], strlen($prefix));
+        }
+    }
+    return null;
 }
 
 function login(Client $c, string $email, string $pass): array
@@ -227,12 +300,15 @@ try {
     // =========================================================================================
     group('AUTH — Registration');
     // =========================================================================================
-    check('A01', 'Valid registration creates the user and logs them in', function () use ($a, $emailA, $PASS, $pdo) {
+    check('A01', 'Valid registration creates the user, and after email verification they can log in', function () use ($a, $emailA, $PASS, $pdo) {
         $r = registerUser($a, 'Audit User A', $emailA, $PASS);
-        if ($r['status'] !== 302 || !str_contains($r['location'], 'dashboard.php')) {
-            return "expected 302 -> dashboard.php, got {$r['status']} -> {$r['location']}";
+        if (!str_contains($r['body'], 'Check your inbox')) {
+            return "no 'check your inbox' page after registering ({$r['status']} -> {$r['location']})";
         }
-        return expect(userIdByEmail($pdo, $emailA) !== null, 'user row not created');
+        if (userIdByEmail($pdo, $emailA) === null) {
+            return 'user row not created';
+        }
+        return expect($a->get('dashboard.php')['status'] === 200, 'could not use the app after verifying and logging in');
     });
 
     check('A02', 'Duplicate email is rejected', function () use ($emailA, $PASS, $BASE) {
@@ -243,15 +319,15 @@ try {
 
     check('A03', 'Password shorter than 8 chars is rejected', function () use ($stamp, $BASE) {
         $c = new Client($BASE);
-        $r = registerUser($c, 'Short Pass', "short_{$stamp}@audit.test", 'abc12');
-        return expect(str_contains($r['body'], 'at least 8 characters'), 'short password accepted');
+        $r = registerUser($c, 'Short Pass', "short_{$stamp}@audit.test", 'Ab1#xyz');
+        return expect(str_contains($r['body'], 'must contain: at least 8 characters'), 'short password accepted');
     });
 
     check('A04', 'Mismatched confirm password is rejected', function () use ($stamp, $BASE) {
         $c = new Client($BASE);
         $r = $c->post('auth/register.php', [
             'full_name' => 'Mismatch', 'email' => "mm_{$stamp}@audit.test",
-            'password' => 'Password123', 'confirm_password' => 'Password124', 'terms' => 'on',
+            'password' => 'Bluefish#42', 'confirm_password' => 'Bluefish#43', 'terms' => 'on',
         ]);
         return expect(str_contains($r['body'], 'do not match'), 'mismatch accepted');
     });
@@ -260,7 +336,7 @@ try {
         $c = new Client($BASE);
         $r = $c->post('auth/register.php', [
             'full_name' => 'No Terms', 'email' => "nt_{$stamp}@audit.test",
-            'password' => 'Password123', 'confirm_password' => 'Password123',
+            'password' => 'Bluefish#42', 'confirm_password' => 'Bluefish#42',
         ]);
         return expect(str_contains($r['body'], 'Terms of Service'), 'registration without terms accepted');
     });
@@ -269,7 +345,7 @@ try {
         $c = new Client($BASE);
         $email = "longname_{$stamp}@audit.test";
         $createdEmails[] = $email;
-        registerUser($c, str_repeat('N', 150), $email, 'Password123');
+        registerUser($c, str_repeat('N', 150), $email, 'Bluefish#42');
         return expect(userIdByEmail($pdo, $email) === null, 'account created with a 150-char name (DB truncated it to 120)');
     });
 
@@ -277,14 +353,39 @@ try {
         $c = new Client($BASE);
         $email = "longpass_{$stamp}@audit.test";
         $createdEmails[] = $email;
-        registerUser($c, 'Long Pass', $email, str_repeat('p', 80));
+        registerUser($c, 'Long Pass', $email, 'Aa1#' . str_repeat('p', 76));
         return expect(userIdByEmail($pdo, $email) === null, 'account created with an 80-byte password');
     });
 
     check('A08', 'Invalid email format is rejected', function () use ($BASE) {
         $c = new Client($BASE);
-        $r = registerUser($c, 'Bad Email', 'not-an-email', 'Password123');
+        $r = registerUser($c, 'Bad Email', 'not-an-email', 'Bluefish#42');
         return expect(str_contains($r['body'], 'valid email'), 'invalid email accepted');
+    });
+
+    // Password strength: each rule on its own, with every other rule satisfied.
+    $weak = [
+        'A16' => ['no uppercase letter', 'password#123', 'one uppercase letter'],
+        'A17' => ['no number',           'Password#abc', 'one number'],
+        'A18' => ['no special character','Password1234', 'one special character'],
+    ];
+    foreach ($weak as $id => [$what, $pw, $msg]) {
+        check($id, "Password with {$what} is rejected", function () use ($stamp, $BASE, $pdo, &$createdEmails, $id, $pw, $msg) {
+            $c = new Client($BASE);
+            $email = strtolower($id) . "_{$stamp}@audit.test";
+            $createdEmails[] = $email;
+            $r = registerUser($c, 'Weak Pass', $email, $pw);
+            if (userIdByEmail($pdo, $email) !== null) {
+                return 'account created with a weak password';
+            }
+            return expect(str_contains($r['body'], $msg), "no '{$msg}' error shown");
+        });
+    }
+
+    check('A19', 'Registration page lists the password rules', function () use ($BASE) {
+        $r = (new Client($BASE))->get('auth/register.php');
+        return expect(str_contains($r['body'], 'class="pw-rules"') && str_contains($r['body'], 'One special character'),
+            'password rules checklist missing');
     });
 
     // =========================================================================================
@@ -326,7 +427,7 @@ try {
         $createdEmails[] = $email;
         $victim = new Client($BASE);
         $victim->cookies['PHPSESSID'] = $fixed;
-        registerUser($victim, 'Fixation Victim', $email, 'Password123');
+        registerUser($victim, 'Fixation Victim', $email, 'Bluefish#42');
 
         $attacker = new Client($BASE);
         $attacker->cookies['PHPSESSID'] = $fixed;
@@ -787,15 +888,15 @@ try {
     // =========================================================================================
     group('ACCOUNT');
     // =========================================================================================
-    check('C01', 'Profile email cannot be changed to another user\'s email', function () use ($a, $emailB) {
-        $r = $a->post('account.php', ['action' => 'profile', 'full_name' => 'Audit User A', 'email' => $emailB]);
+    check('C01', 'Profile email cannot be changed to another user\'s email', function () use ($a, $emailB, $PASS) {
+        $r = $a->post('account.php', ['action' => 'profile', 'full_name' => 'Audit User A', 'email' => $emailB, 'current_password' => $PASS]);
         return expect(str_contains($r['body'], 'already used by another account'), 'duplicate email accepted');
     });
 
     check('C02', 'Password change requires the correct current password', function () use ($a) {
         $r = $a->post('account.php', [
             'action' => 'password', 'current_password' => 'nope-wrong',
-            'new_password' => 'NewAudit#2026', 'confirm_password' => 'NewAudit#2026',
+            'new_password' => 'NewOcean#2026', 'confirm_password' => 'NewOcean#2026',
         ]);
         return expect(str_contains($r['body'], 'Current password is incorrect'), 'wrong current password accepted');
     });
@@ -803,14 +904,23 @@ try {
     check('C03', 'Password change works and the new password logs in', function () use ($a, $emailA, $PASS, $BASE) {
         $r = $a->post('account.php', [
             'action' => 'password', 'current_password' => $PASS,
-            'new_password' => 'NewAudit#2026', 'confirm_password' => 'NewAudit#2026',
+            'new_password' => 'NewOcean#2026', 'confirm_password' => 'NewOcean#2026',
         ]);
         if (!str_contains($r['location'], 'updated=password')) {
             return "password change failed: {$r['status']} -> {$r['location']}";
         }
         $c = new Client($BASE);
-        $l = login($c, $emailA, 'NewAudit#2026');
+        $l = login($c, $emailA, 'NewOcean#2026');
         return expect($l['status'] === 302 && str_contains($l['location'], 'dashboard.php'), 'new password does not log in');
+    });
+
+    check('C04', 'Password change rejects a weak new password', function () use ($a) {
+        $r = $a->post('account.php', [
+            'action' => 'password', 'current_password' => 'NewOcean#2026',
+            'new_password' => 'weakpassword', 'confirm_password' => 'weakpassword',
+        ]);
+        return expect(!str_contains($r['location'], 'updated=password') && str_contains($r['body'], 'New password must contain'),
+            'weak new password accepted');
     });
 
     // =========================================================================================
@@ -1177,6 +1287,9 @@ try {
         $email = "brute_{$stamp}@audit.test";
         $createdEmails[] = $email;
         registerUser(new Client($BASE), 'Brute Target', $email, 'RightPass#2026');
+        // registerUser() ends with a successful login, and the lock only counts failures AFTER the
+        // last login; activity_log times are whole seconds, so start the failures a second later.
+        sleep(1);
         $c = new Client($BASE);
         for ($i = 0; $i < 5; $i++) {
             login($c, $email, "wrong-$i");
@@ -1204,6 +1317,389 @@ try {
         }
         return expect(str_contains($r['body'], 'Invalid email or password') && !str_contains($r['body'], 'Too many failed'),
             'unknown email behaves differently');
+    });
+
+    // =========================================================================================
+    group('SECURITY — Sessions, email change, rate limits');
+    // =========================================================================================
+    $secEmail = "sec_{$stamp}@audit.test";
+    $secPass  = 'Bluefish#42';
+    $createdEmails[] = $secEmail;
+    $sec = new Client($BASE);
+    clearRateLimits();
+    registerUser($sec, 'Security Tester', $secEmail, $secPass);
+
+    check('Z01', 'Changing the email without the current password is refused', function () use ($sec, $pdo, $secEmail, $stamp) {
+        $r = $sec->post('account.php', ['action' => 'profile', 'full_name' => 'Security Tester', 'email' => "sec2_{$stamp}@audit.test"]);
+        $email = $pdo->query('SELECT email FROM users WHERE id = ' . (int)userIdByEmail($pdo, $secEmail))->fetchColumn();
+        return expect($email === $secEmail && str_contains($r['body'], 'Enter your current password'), 'email changed without a password');
+    });
+
+    check('Z02', 'Changing the email with a wrong password is refused', function () use ($sec, $pdo, $secEmail, $stamp) {
+        $r = $sec->post('account.php', ['action' => 'profile', 'full_name' => 'Security Tester',
+            'email' => "sec2_{$stamp}@audit.test", 'current_password' => 'Wrong#Pass99']);
+        return expect(userIdByEmail($pdo, $secEmail) !== null && str_contains($r['body'], 'Current password is incorrect'),
+            'email changed with a wrong password');
+    });
+
+    check('Z03', 'Changing the email with the right password works (name-only changes need no password)', function () use ($sec, $pdo, $secEmail, $secPass, $stamp) {
+        $id = userIdByEmail($pdo, $secEmail);
+        $r = $sec->post('account.php', ['action' => 'profile', 'full_name' => 'Security Tester',
+            'email' => "sec2_{$stamp}@audit.test", 'current_password' => $secPass]);
+        // Accepted = a confirmation link is on its way (the change itself is tested in E09).
+        $changed = str_contains($r['location'], 'updated=email_pending');
+        $r2 = $sec->post('account.php', ['action' => 'profile', 'full_name' => 'Security Tester 2', 'email' => $secEmail]);
+        return expect($changed && str_contains($r2['location'], 'updated=profile'), 'right password refused, or name change needed a password');
+    });
+
+    check('Z04', 'Changing the password signs out other devices but keeps this one signed in', function () use ($BASE, $sec, $secEmail, $secPass) {
+        $other = new Client($BASE);
+        login($other, $secEmail, $secPass);
+        if ($other->get('dashboard.php')['status'] !== 200) {
+            return 'second device could not sign in';
+        }
+        $r = $sec->post('account.php', ['action' => 'password', 'current_password' => $secPass,
+            'new_password' => 'Greenfish#77', 'confirm_password' => 'Greenfish#77']);
+        if (!str_contains($r['location'], 'updated=password')) {
+            return "password change failed: {$r['status']} -> {$r['location']}";
+        }
+        $o = $other->get('dashboard.php');
+        $s = $sec->get('dashboard.php');
+        if ($o['status'] !== 302 || !str_contains($o['location'], 'reason=signed_out')) {
+            return 'other device is still signed in after the password change';
+        }
+        return expect($s['status'] === 200, 'the device that changed the password was signed out');
+    });
+
+    check('Z05', 'Login page explains why the user was signed out', function () use ($BASE) {
+        $a = (new Client($BASE))->get('auth/login.php?reason=expired')['body'];
+        $b = (new Client($BASE))->get('auth/login.php?reason=signed_out')['body'];
+        $c = (new Client($BASE))->get('auth/login.php?reason=<script>')['body'];
+        return expect(str_contains($a, 'minutes of inactivity') && str_contains($b, 'password was changed') && !str_contains($c, '<script>'),
+            'missing or unsafe sign-out message');
+    });
+
+    check('Z06', 'Sessions idle for more than 30 minutes expire', function () {
+        $now = time();
+        return expect(!session_idle_expired($now - 29 * 60, $now) && session_idle_expired($now - 31 * 60, $now) && session_idle_expired(0, $now),
+            'idle rule wrong');
+    });
+
+    check('Z07', 'Common passwords are refused even when they meet the rules', function () use ($BASE, $pdo, $stamp, &$createdEmails) {
+        foreach (['Password1!', 'P@ssw0rd1', 'Welcome2026!', 'Qwerty123!', 'Afterbill#1'] as $i => $pw) {
+            $email = "common{$i}_{$stamp}@audit.test";
+            $createdEmails[] = $email;
+            $r = registerUser(new Client($BASE), 'Common Pass', $email, $pw);
+            if (userIdByEmail($pdo, $email) !== null || !str_contains($r['body'], 'too easy to guess')) {
+                return "'{$pw}' was accepted";
+            }
+        }
+        return true;
+    });
+
+    check('Z08', 'Passwords built on the user\'s own name or email are refused', function () use ($BASE, $pdo, $stamp, &$createdEmails) {
+        $email = "marisol_{$stamp}@audit.test";
+        $createdEmails[] = $email;
+        registerUser(new Client($BASE), 'Marisol Reyes', $email, 'Reyes#2026');
+        return expect(userIdByEmail($pdo, $email) === null, 'password containing the surname accepted');
+    });
+
+    check('Z09', 'Too many failed logins from one IP are blocked, across different emails', function () use ($BASE, $stamp, $secEmail) {
+        $c = new Client($BASE);
+        for ($i = 0; $i < RATE_LIMITS['login_failed'][0]; $i++) {
+            login($c, "spray{$i}_{$stamp}@audit.test", 'Spring#2026x');   // a different (unknown) email each time
+        }
+        $r = login(new Client($BASE), $secEmail, 'Greenfish#77');        // right password for a real account
+        return expect($r['status'] !== 302 && str_contains($r['body'], 'Too many attempts from your network'),
+            'login still allowed after ' . RATE_LIMITS['login_failed'][0] . ' failures from this IP');
+    });
+
+    check('Z10', 'Too many registrations from one IP are blocked', function () use ($BASE, $pdo, $stamp, &$createdEmails) {
+        for ($i = 0; $i < RATE_LIMITS['register'][0]; $i++) {
+            registerUser(new Client($BASE), 'Spam', "spam{$i}_{$stamp}", 'x');   // invalid on purpose: attempts count too
+        }
+        $email = "spamok_{$stamp}@audit.test";
+        $createdEmails[] = $email;
+        $r = registerUser(new Client($BASE), 'Spam Ok', $email, 'Bluefish#42');
+        return expect(userIdByEmail($pdo, $email) === null && str_contains($r['body'], 'Too many attempts from your network'),
+            'registration still allowed after ' . RATE_LIMITS['register'][0] . ' attempts');
+    });
+
+    // =========================================================================================
+    group('SECURITY — Content-Security-Policy & account deletion');
+    // =========================================================================================
+    check('Y01', 'Content-Security-Policy only allows script files from this site', function () use ($BASE) {
+        $h = (new Client($BASE))->get('auth/login.php')['headers'];
+        if (!preg_match('/^Content-Security-Policy:\s*(.+)$/mi', $h, $m)) {
+            return 'no Content-Security-Policy header';
+        }
+        $csp = $m[1];
+        if (!preg_match("/script-src 'self'(;|$)/", $csp) || str_contains($csp, 'unsafe-eval')) {
+            return "script-src is not locked to 'self': $csp";
+        }
+        foreach (["object-src 'none'", "frame-ancestors 'none'", "base-uri 'self'", "form-action 'self'"] as $need) {
+            if (!str_contains($csp, $need)) {
+                return "missing $need";
+            }
+        }
+        return true;
+    });
+
+    check('Y02', 'No page uses inline scripts or inline event handlers (they would be blocked)', function () use ($BASE, $a) {
+        $pages = ['dashboard.php', 'bills.php', 'add_bill.php', 'calendar.php', 'reports.php', 'payments.php',
+                  'reminders.php', 'account.php', 'budgets.php', 'activity.php'];
+        $anon = new Client($BASE);
+        $bodies = ['index.php' => $anon->get('index.php')['body'], 'auth/login.php' => $anon->get('auth/login.php')['body'],
+                   'auth/register.php' => $anon->get('auth/register.php')['body']];
+        foreach ($pages as $p) {
+            $r = $a->get($p);
+            if ($r['status'] !== 200) {
+                return "$p returned {$r['status']} (audit user A not signed in?)";
+            }
+            $bodies[$p] = $r['body'];
+        }
+        foreach ($bodies as $p => $body) {
+            if (preg_match('/<script(?![^>]*\bsrc=)[^>]*>/i', $body)) {
+                return "$p has an inline <script> block";
+            }
+            // Look at attribute NAMES only: quoted values are blanked first, so escaped user text
+            // inside an attribute (e.g. a bill named <img onerror=...>) is not mistaken for one.
+            preg_match_all('/<[a-z][^>]*>/i', $body, $tags);
+            foreach ($tags[0] as $tag) {
+                $names = preg_replace('/"[^"]*"|\'[^\']*\'/', '""', $tag);
+                if (preg_match('/\son[a-z]+\s*=/i', $names)) {
+                    return "$p has an inline event handler: " . substr($tag, 0, 80);
+                }
+            }
+            if (stripos($body, 'href="javascript:') !== false) {
+                return "$p has a javascript: link";
+            }
+        }
+        return true;
+    });
+
+    check('Y03', 'Confirmations and auto-submit filters still work (data attributes + app.js)', function () use ($a) {
+        $bills = $a->get('bills.php')['body'];
+        $pay   = $a->get('payments.php')['body'];
+        $ok = str_contains($bills, 'data-autosubmit') && str_contains($pay, 'data-autosubmit')
+            && str_contains($bills, 'assets/js/app.js') && str_contains($pay, 'assets/js/app.js')
+            && str_contains($a->get('account.php')['body'], 'data-confirm=');
+        return expect($ok, 'data attributes or app.js missing');
+    });
+
+    $delEmail = "delete_{$stamp}@audit.test";
+    $delPass  = 'Seashell#84';
+    $createdEmails[] = $delEmail;
+    $del = new Client($BASE);
+    clearRateLimits();
+    registerUser($del, 'Delete Tester', $delEmail, $delPass);
+    $delId = userIdByEmail($pdo, $delEmail);
+    if ($delId) {
+        // Something in every table that hangs off the user, to prove it all goes with them.
+        $cat = (int)$pdo->query('SELECT category_id FROM categories ORDER BY category_id LIMIT 1')->fetchColumn();
+        $pdo->prepare("INSERT INTO bills (user_id, bill_name, amount, due_date, category_id, is_recurring, status) VALUES (?, 'Del parent', 100, CURDATE(), ?, 1, 'paid')")->execute([$delId, $cat]);
+        $parent = (int)$pdo->lastInsertId();
+        $pdo->prepare("INSERT INTO bills (user_id, bill_name, amount, due_date, category_id, parent_bill_id, is_recurring, status) VALUES (?, 'Del child', 100, CURDATE() + INTERVAL 1 MONTH, ?, ?, 1, 'unpaid')")->execute([$delId, $cat, $parent]);
+        $pdo->prepare("INSERT INTO payments (bill_id, payment_date, amount_paid, payment_method) VALUES (?, CURDATE(), 100, 'cash')")->execute([$parent]);
+        $pdo->prepare('INSERT INTO budgets (user_id, category_id, monthly_limit) VALUES (?, ?, 500)')->execute([$delId, $cat]);
+    }
+
+    check('Y04', 'Deleting the account needs the right password and the confirmation box', function () use ($del, $pdo, $delId, $delPass) {
+        if (!$delId) {
+            return 'delete-test user was not created';
+        }
+        $r1 = $del->post('account.php', ['action' => 'delete_account', 'delete_password' => 'Wrong#Pass99', 'confirm_delete' => 'yes']);
+        $r2 = $del->post('account.php', ['action' => 'delete_account', 'delete_password' => $delPass]);
+        $r3 = $del->postRaw('account.php', ['action' => 'delete_account', 'delete_password' => $delPass, 'confirm_delete' => 'yes']);
+        $exists = (bool)$pdo->query("SELECT COUNT(*) FROM users WHERE id = $delId")->fetchColumn();
+        if (!$exists) {
+            return 'account was deleted by a bad request';
+        }
+        return expect(str_contains($r1['body'], 'Password is incorrect') && str_contains($r2['body'], 'Tick the box'),
+            'missing error messages');
+    });
+
+    check('Y05', 'Deleting the account removes the user and all their data, and ends the session', function () use ($BASE, $del, $pdo, $delId, $delEmail, $delPass) {
+        if (!$delId) {
+            return 'delete-test user was not created';
+        }
+        $r = $del->post('account.php', ['action' => 'delete_account', 'delete_password' => $delPass, 'confirm_delete' => 'yes']);
+        if ($r['status'] !== 302 || !str_contains($r['location'], 'reason=deleted')) {
+            return "delete failed: {$r['status']} -> {$r['location']}";
+        }
+        foreach (['users' => "id = $delId", 'bills' => "user_id = $delId", 'budgets' => "user_id = $delId",
+                  'activity_log' => "user_id = $delId",
+                  'payments' => "bill_id IN (SELECT bill_id FROM bills WHERE user_id = $delId)"] as $table => $where) {
+            if ((int)$pdo->query("SELECT COUNT(*) FROM $table WHERE $where")->fetchColumn() > 0) {
+                return "rows left in $table";
+            }
+        }
+        if ($del->get('dashboard.php')['status'] !== 302) {
+            return 'session still works after the account was deleted';
+        }
+        $l = login(new Client($BASE), $delEmail, $delPass);
+        $msg = (new Client($BASE))->get('auth/login.php?reason=deleted')['body'];
+        return expect($l['status'] !== 302 && str_contains($msg, 'permanently deleted'), 'deleted account can still log in, or no message');
+    });
+
+    // =========================================================================================
+    group('EMAIL — Verification, password reset, email change');
+    // =========================================================================================
+    $evEmail = "verify_{$stamp}@audit.test";
+    $evPass  = 'Lantern#Bay31';
+    $createdEmails[] = $evEmail;
+    $ev = new Client($BASE);
+
+    check('E01', 'Registering sends a verification email and does not sign the user in', function () use ($ev, $pdo, $evEmail, $evPass, $MAIL_CONFIG) {
+        $mark = mailMark();
+        $r = registerUser($ev, 'Verify Tester', $evEmail, $evPass, false);
+        $id = userIdByEmail($pdo, $evEmail);
+        if (!$id || $pdo->query("SELECT email_verified_at FROM users WHERE id = $id")->fetchColumn() !== null) {
+            return 'account missing, or already verified';
+        }
+        if ($ev->get('dashboard.php')['status'] !== 302) {
+            return 'registration signed the user in before verifying';
+        }
+        $link = mailLink($evEmail, 'auth/verify_email.php', $mark);
+        return expect($link !== null && str_contains($r['body'], 'Check your inbox'), 'no verification email with a link');
+    });
+
+    check('E02', 'Unverified users cannot log in; the reason is only shown after the right password', function () use ($BASE, $evEmail, $evPass) {
+        $right = login(new Client($BASE), $evEmail, $evPass);
+        $wrong = login(new Client($BASE), $evEmail, 'Wrong#Pass99');
+        if ($right['status'] === 302) {
+            return 'unverified account logged in';
+        }
+        return expect(str_contains($right['body'], 'verify your email') && !str_contains($wrong['body'], 'verify your email')
+            && str_contains($wrong['body'], 'Invalid email or password'), 'wrong messages');
+    });
+
+    check('E03', 'The verification link works once, then the user can log in', function () use ($BASE, $pdo, $evEmail, $evPass) {
+        $link = mailLink($evEmail, 'auth/verify_email.php');
+        if ($link === null) {
+            return 'no verification link';
+        }
+        $first  = (new Client($BASE))->get($link);
+        $second = (new Client($BASE))->get($link);
+        $l = login(new Client($BASE), $evEmail, $evPass);
+        $verified = $pdo->query('SELECT email_verified_at FROM users WHERE id = ' . (int)userIdByEmail($pdo, $evEmail))->fetchColumn() !== null;
+        return expect(str_contains($first['body'], 'Email verified') && $second['status'] === 400 && $verified
+            && $l['status'] === 302 && str_contains($l['location'], 'dashboard.php'), 'link did not verify, worked twice, or login failed');
+    });
+
+    check('E04', 'Forgot password: same answer for known and unknown emails; only real accounts get an email', function () use ($BASE, $evEmail, $stamp) {
+        $ghost = "ghost_reset_{$stamp}@audit.test";
+        $mark = mailMark();
+        $known   = (new Client($BASE))->post('auth/forgot_password.php', ['email' => $evEmail]);
+        $unknown = (new Client($BASE))->post('auth/forgot_password.php', ['email' => $ghost]);
+        $norm = fn ($b, $e) => str_replace(htmlspecialchars($e), 'X', $b);
+        if (strip_tags($norm($known['body'], $evEmail)) !== strip_tags($norm($unknown['body'], $ghost))) {
+            return 'the page answers differently for a registered email';
+        }
+        return expect(mailLink($evEmail, 'auth/reset_password.php', $mark) !== null && mailsTo($ghost, $mark) === [],
+            'reset email missing, or sent to an unknown address');
+    });
+
+    check('E05', 'Reset link: opening it changes nothing; it sets a strong new password once and signs out other sessions', function () use ($BASE, $pdo, $evEmail, $evPass) {
+        $signedIn = new Client($BASE);
+        login($signedIn, $evEmail, $evPass);
+        $link = mailLink($evEmail, 'auth/reset_password.php');
+        $token = substr($link, strpos($link, '=') + 1);
+        $c = new Client($BASE);
+        $form = $c->get($link);
+        if (!str_contains($form['body'], 'Choose a new password') || login(new Client($BASE), $evEmail, $evPass)['status'] !== 302) {
+            return 'reset form missing, or just opening the link changed the password';
+        }
+        $weak = $c->post('auth/reset_password.php', ['token' => $token, 'password' => 'Password1!', 'confirm_password' => 'Password1!'], $link);
+        if (!str_contains($weak['body'], 'too easy to guess')) {
+            return 'weak password accepted on reset';
+        }
+        $ok = $c->post('auth/reset_password.php', ['token' => $token, 'password' => 'Meadow#Lark62', 'confirm_password' => 'Meadow#Lark62'], $link);
+        if (!str_contains($ok['location'], 'reason=reset')) {
+            return "reset failed: {$ok['status']} -> {$ok['location']}";
+        }
+        $again = (new Client($BASE))->get($link);
+        $old = login(new Client($BASE), $evEmail, $evPass);
+        $new = login(new Client($BASE), $evEmail, 'Meadow#Lark62');
+        $kicked = $signedIn->get('dashboard.php')['status'] === 302;
+        return expect($again['status'] === 400 && $old['status'] !== 302 && $new['status'] === 302 && $kicked,
+            'link reusable, old password still works, new one does not, or other sessions stayed signed in');
+    });
+
+    check('E06', 'Expired reset links are refused, and a newer link cancels the older one', function () use ($BASE, $pdo, $evEmail) {
+        $c = new Client($BASE);
+        $c->post('auth/forgot_password.php', ['email' => $evEmail]);
+        $first = mailLink($evEmail, 'auth/reset_password.php');
+        $c->post('auth/forgot_password.php', ['email' => $evEmail]);
+        $second = mailLink($evEmail, 'auth/reset_password.php');
+        if ($first === $second || (new Client($BASE))->get($first)['status'] !== 400) {
+            return 'older reset link still works after a new one was sent';
+        }
+        $pdo->prepare('UPDATE auth_tokens SET expires_at = NOW() - INTERVAL 1 MINUTE WHERE token_hash = ?')
+            ->execute([hash('sha256', substr($second, strpos($second, '=') + 1))]);
+        return expect((new Client($BASE))->get($second)['status'] === 400, 'expired reset link accepted');
+    });
+
+    check('E07', 'Emailed links use the configured site address, not the Host header (link poisoning)', function () use ($BASE, $evEmail, $MAIL_CONFIG) {
+        $c = new Client($BASE);
+        $c->headers = ['Host: evil.example'];
+        $mark = mailMark();
+        $c->post('auth/forgot_password.php', ['email' => $evEmail]);
+        $mails = mailsTo($evEmail, $mark);
+        if ($mails === []) {
+            return 'no email sent (could not test)';
+        }
+        $body = end($mails)['body'];
+        return expect(!str_contains($body, 'evil.example') && str_contains($body, $MAIL_CONFIG['app_url']), 'reset link points at the attacker host');
+    });
+
+    check('E08', 'Only a hash of each emailed token is stored', function () use ($pdo, $evEmail) {
+        $link = mailLink($evEmail, 'auth/reset_password.php');
+        $token = substr($link, strpos($link, '=') + 1);
+        $plain = (int)$pdo->query('SELECT COUNT(*) FROM auth_tokens WHERE token_hash = ' . $pdo->quote($token))->fetchColumn();
+        $hashed = (int)$pdo->query('SELECT COUNT(*) FROM auth_tokens WHERE token_hash = ' . $pdo->quote(hash('sha256', $token)))->fetchColumn();
+        return expect($plain === 0 && $hashed === 1, 'token stored in plain text');
+    });
+
+    check('E09', 'Email change only happens after the new address confirms; the old address is told', function () use ($BASE, $pdo, $evEmail, $stamp) {
+        $c = new Client($BASE);
+        login($c, $evEmail, 'Meadow#Lark62');
+        $id = userIdByEmail($pdo, $evEmail);
+        $newEmail = "verify_new_{$stamp}@audit.test";
+        $mark = mailMark();
+        $r = $c->post('account.php', ['action' => 'profile', 'full_name' => 'Verify Tester', 'email' => $newEmail, 'current_password' => 'Meadow#Lark62']);
+        $stillOld = $pdo->query("SELECT email FROM users WHERE id = $id")->fetchColumn() === $evEmail;
+        $link = mailLink($newEmail, 'auth/verify_email.php', $mark);
+        $warned = count(mailsTo($evEmail, $mark)) === 1;
+        if (!str_contains($r['location'], 'email_pending') || !$stillOld || !$link || !$warned) {
+            return 'email changed before confirmation, or emails missing';
+        }
+        (new Client($BASE))->get($link);
+        $now = $pdo->query("SELECT email FROM users WHERE id = $id")->fetchColumn();
+        // put it back for the tests that follow
+        $pdo->prepare('UPDATE users SET email = ? WHERE id = ?')->execute([$evEmail, $id]);
+        return expect($now === $newEmail, 'confirmation link did not change the email');
+    });
+
+    check('E10', 'Too many reset/verification emails from one IP are blocked', function () use ($BASE, $stamp) {
+        $c = new Client($BASE);
+        for ($i = 0; $i < RATE_LIMITS['email_request'][0]; $i++) {
+            $c->post('auth/forgot_password.php', ['email' => "flood{$i}_{$stamp}@audit.test"]);
+        }
+        $r = $c->post('auth/resend_verification.php', ['email' => "flood_x_{$stamp}@audit.test"]);
+        return expect(str_contains($r['body'], 'Too many attempts from your network'), 'no limit on emails');
+    });
+
+    check('E11', 'Mail log, Composer packages and mail settings are not web-accessible', function () use ($BASE) {
+        $c = new Client($BASE);
+        foreach (['storage/mail.log', 'vendor/autoload.php', 'vendor/phpmailer/phpmailer/README.md', 'composer.json',
+                  'composer.lock', 'config/mail.php', 'config/mail.local.example.php'] as $path) {
+            $r = $c->get($path);
+            if ($r['status'] === 200) {
+                return "$path is readable over HTTP";
+            }
+        }
+        return true;
     });
 
     // =========================================================================================

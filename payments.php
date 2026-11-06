@@ -4,12 +4,8 @@
  * Every recorded payment, filterable by month and method, with CSV export and undo.
  */
 
-session_start();
-
-if (!isset($_SESSION['user_id'])) {
-    header('Location: auth/login.php');
-    exit;
-}
+require_once __DIR__ . '/includes/auth.php';
+require_login(); // session check, idle timeout, sign-out after a password change
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/csrf.php';
@@ -163,11 +159,11 @@ $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' 
             <form method="GET" action="" class="filter-bar">
                 <div class="filter-group">
                     <label for="month">Month</label>
-                    <input type="month" id="month" name="month" value="<?= htmlspecialchars($monthFilter) ?>" onchange="this.form.submit()">
+                    <input type="month" id="month" name="month" value="<?= htmlspecialchars($monthFilter) ?>" data-autosubmit>
                 </div>
                 <div class="filter-group">
                     <label for="method">Method</label>
-                    <select id="method" name="method" onchange="this.form.submit()">
+                    <select id="method" name="method" data-autosubmit>
                         <option value="">All</option>
                         <?php foreach ($paymentMethodLabels as $val => $label): ?>
                             <option value="<?= $val ?>" <?= $methodFilter === $val ? 'selected' : '' ?>><?= $label ?></option>
@@ -216,13 +212,10 @@ $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' 
                                         <td class="muted"><?= $p['notes'] !== null ? htmlspecialchars($p['notes']) : '—' ?></td>
                                         <td>
                                             <form method="POST" action="undo_payment.php" class="inline-form"
-                                                onsubmit="return confirm('Remove this payment? The bill will go back to unpaid.');">
+                                                data-confirm="Remove this payment? The bill will go back to unpaid.">
                                                 <input type="hidden" name="payment_id" value="<?= (int)$p['payment_id'] ?>">
                                                 <input type="hidden" name="return" value="payments">
-<<<<<<< HEAD
-=======
                                                 <?= csrf_field() ?>
->>>>>>> origin/sqa/audit-fixes-and-features
                                                 <button type="submit" class="btn-outline red">Undo</button>
                                             </form>
                                         </td>
@@ -243,5 +236,6 @@ $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' 
         </main>
     </div>
 </div>
+    <script src="assets/js/app.js?v=<?= filemtime(__DIR__ . '/assets/js/app.js') ?>"></script>
 </body>
 </html>

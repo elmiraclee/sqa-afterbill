@@ -4,12 +4,8 @@
  * Monthly spending limit per category, with progress against the bills due that month.
  */
 
-session_start();
-
-if (!isset($_SESSION['user_id'])) {
-    header('Location: auth/login.php');
-    exit;
-}
+require_once __DIR__ . '/includes/auth.php';
+require_login(); // session check, idle timeout, sign-out after a password change
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/csrf.php';
@@ -278,7 +274,7 @@ $statusLabels = ['ok' => 'On track', 'near' => 'Near limit', 'over' => 'Over bud
                                             </form>
                                             <?php if ($u['limit'] !== null): ?>
                                                 <form method="POST" action="" class="inline-form"
-                                                      onsubmit="return confirm('Remove the budget for ' + <?= htmlspecialchars(json_encode($u['category_name']), ENT_QUOTES) ?> + '?');">
+                                                      data-confirm="<?= htmlspecialchars('Remove the budget for ' . $u['category_name'] . '?') ?>">
                                                     <?= csrf_field() ?>
                                                     <input type="hidden" name="action" value="remove">
                                                     <input type="hidden" name="month" value="<?= $monthParam ?>">
@@ -302,5 +298,6 @@ $statusLabels = ['ok' => 'On track', 'near' => 'Near limit', 'over' => 'Over bud
         </main>
     </div>
 </div>
+    <script src="assets/js/app.js?v=<?= filemtime(__DIR__ . '/assets/js/app.js') ?>"></script>
 </body>
 </html>

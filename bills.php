@@ -3,12 +3,8 @@
  * AfterBill - Bill List
  */
 
-session_start();
-
-if (!isset($_SESSION['user_id'])) {
-    header('Location: auth/login.php');
-    exit;
-}
+require_once __DIR__ . '/includes/auth.php';
+require_login(); // session check, idle timeout, sign-out after a password change
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/recurring_bills.php';
@@ -494,7 +490,7 @@ unset($_SESSION['flash_budget_warning']);
 
                 <div class="filter-group">
                     <label for="status">Status</label>
-                    <select id="status" name="status" onchange="this.form.submit()">
+                    <select id="status" name="status" data-autosubmit>
                         <option value="" <?= $statusFilter === '' ? 'selected' : '' ?>>All</option>
                         <option value="unpaid" <?= $statusFilter === 'unpaid' ? 'selected' : '' ?>>Unpaid</option>
                         <option value="paid" <?= $statusFilter === 'paid' ? 'selected' : '' ?>>Paid</option>
@@ -503,7 +499,7 @@ unset($_SESSION['flash_budget_warning']);
 
                 <div class="filter-group">
                     <label for="category_id">Category</label>
-                    <select id="category_id" name="category_id" onchange="this.form.submit()">
+                    <select id="category_id" name="category_id" data-autosubmit>
                         <option value="">All</option>
                         <?php foreach ($categories as $cat): ?>
                             <option value="<?= (int)$cat['category_id'] ?>"
@@ -576,7 +572,7 @@ unset($_SESSION['flash_budget_warning']);
                                                     <a href="mark_paid.php?bill_id=<?= (int)$bill['bill_id'] ?>" class="btn-pay">Mark as Paid</a>
                                                 <?php else: ?>
                                                     <form method="POST" action="undo_payment.php" class="delete-form"
-                                                        onsubmit="return confirm('Undo the payment for ' + <?= htmlspecialchars(json_encode($bill['bill_name']), ENT_QUOTES) ?> + '? Its payment record will be removed and the bill set back to unpaid.');">
+                                                        data-confirm="<?= htmlspecialchars('Undo the payment for "' . $bill['bill_name'] . '"? Its payment record will be removed and the bill set back to unpaid.') ?>">
                                                         <input type="hidden" name="bill_id" value="<?= (int)$bill['bill_id'] ?>">
                                                         <input type="hidden" name="return" value="bills">
                                                         <?= csrf_field() ?>
@@ -585,7 +581,7 @@ unset($_SESSION['flash_budget_warning']);
                                                 <?php endif; ?>
                                                 <a href="edit_bill.php?bill_id=<?= (int)$bill['bill_id'] ?>" class="btn-edit">Edit</a>
                                                 <form method="POST" action="delete_bill.php" class="delete-form"
-                                                    onsubmit="return confirm('Delete ' + <?= htmlspecialchars(json_encode($bill['bill_name']), ENT_QUOTES) ?> + '? This cannot be undone.');">
+                                                    data-confirm="<?= htmlspecialchars('Delete "' . $bill['bill_name'] . '"? This cannot be undone.') ?>">
                                                     <input type="hidden" name="bill_id" value="<?= (int)$bill['bill_id'] ?>">
                                                     <?= csrf_field() ?>
                                                     <button type="submit" class="btn-delete">Delete</button>
@@ -602,5 +598,6 @@ unset($_SESSION['flash_budget_warning']);
         </main>
     </div>
 </div>
+    <script src="assets/js/app.js?v=<?= filemtime(__DIR__ . '/assets/js/app.js') ?>"></script>
 </body>
 </html>

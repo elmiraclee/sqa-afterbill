@@ -3,9 +3,9 @@
  * AfterBill - Landing Page
  */
 
-session_start();
+require_once __DIR__ . '/includes/auth.php';
 
-$loggedIn = isset($_SESSION['user_id']);
+$loggedIn = auth_check();
 $firstName = $loggedIn ? htmlspecialchars(explode(' ', $_SESSION['user_name'] ?? 'there')[0]) : '';
 ?>
 <!DOCTYPE html>
