@@ -18,12 +18,23 @@ const ACTIVITY_TYPES = [
     'bill_deleted'     => ['Bill deleted',      'red',   'bills'],
     'payment_recorded' => ['Payment recorded',  'green', 'payments'],
     'payment_undone'   => ['Payment undone',    'amber', 'payments'],
+    'receipt_attached' => ['Receipt attached',  'blue',  'payments'],
+    'receipt_removed'  => ['Receipt removed',   'gray',  'payments'],
     'profile_updated'  => ['Profile updated',   'blue',  'account'],
     'password_changed' => ['Password changed',  'amber', 'account'],
     'password_reset'   => ['Password reset',    'amber', 'account'],
     'email_verified'   => ['Email verified',    'green', 'account'],
     'budget_set'       => ['Budget set',        'blue',  'budgets'],
     'budget_removed'   => ['Budget removed',    'gray',  'budgets'],
+    'category_added'   => ['Category added',    'blue',  'budgets'],
+    'category_renamed' => ['Category renamed',  'amber', 'budgets'],
+    'category_deleted' => ['Category deleted',  'gray',  'budgets'],
+    'reminders_updated' => ['Reminder settings', 'blue', 'account'],
+    'two_factor_enabled'  => ['Two-factor login on',  'green', 'auth'],
+    'two_factor_disabled' => ['Two-factor login off', 'red',   'auth'],
+    'recovery_codes_regenerated' => ['New recovery codes', 'amber', 'auth'],
+    'sessions_revoked'    => ['Devices signed out',   'amber', 'auth'],
+    'data_exported'       => ['Data downloaded',      'blue',  'account'],
 ];
 
 const ACTIVITY_GROUPS = [
@@ -31,7 +42,7 @@ const ACTIVITY_GROUPS = [
     'bills'    => 'Bills',
     'payments' => 'Payments',
     'account'  => 'Account',
-    'budgets'  => 'Budgets',
+    'budgets'  => 'Budgets & categories',
 ];
 
 function logActivity(PDO $pdo, int $userId, string $action, string $details = ''): void

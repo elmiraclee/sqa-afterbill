@@ -10,6 +10,7 @@ require_login(); // session check, idle timeout, sign-out after a password chang
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/csrf.php';
 require_once __DIR__ . '/includes/csv.php';
+require_once __DIR__ . '/includes/xlsx.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -36,7 +37,7 @@ if (!isset($paymentMethodLabels[$methodFilter])) {
     $methodFilter = '';
 }
 
-$sql = 'SELECT p.payment_id, p.payment_date, p.amount_paid, p.payment_method, p.notes,
+$sql = 'SELECT p.payment_id, p.payment_date, p.amount_paid, p.payment_method, p.notes, %s
                b.bill_id, b.bill_name, b.amount AS bill_amount, b.due_date, c.category_name
         FROM payments p
         JOIN bills b ON b.bill_id = p.bill_id
@@ -56,8 +57,16 @@ if ($methodFilter !== '') {
 }
 $sql .= ' ORDER BY p.payment_date DESC, p.payment_id DESC';
 
-$stmt = $pdo->prepare($sql);
-$stmt->execute($params);
+$receiptsReady = true;
+try {
+    $stmt = $pdo->prepare(sprintf($sql, 'p.receipt_file,'));
+    $stmt->execute($params);
+} catch (PDOException $e) {
+    $receiptsReady = false;
+    // Migration 004 not run: no receipt column yet.
+    $stmt = $pdo->prepare(sprintf($sql, 'NULL AS receipt_file,'));
+    $stmt->execute($params);
+}
 $payments = $stmt->fetchAll();
 
 // CSV export of exactly what the current filters show.
@@ -79,6 +88,44 @@ if (($_GET['export'] ?? '') === 'csv') {
     exit;
 }
 
+// Styled Excel export of exactly what the current filters show.
+if (($_GET['export'] ?? '') === 'xlsx') {
+    $rows = [];
+    $sum = 0.0;
+    foreach ($payments as $p) {
+        $rows[] = [
+            $p['payment_date'], $p['bill_name'], $p['category_name'], $p['due_date'], (float)$p['amount_paid'],
+            $paymentMethodLabels[$p['payment_method']], $p['payment_date'] > $p['due_date'] ? 'Late' : 'On time',
+            $p['notes'] ?? '', $p['receipt_file'] !== null ? 'Yes' : '—',
+        ];
+        $sum += (float)$p['amount_paid'];
+    }
+    $filters = array_filter([
+        $monthFilter !== '' ? (new DateTime($monthFilter . '-01'))->format('F Y') : 'All time',
+        $methodFilter !== '' ? 'Method: ' . $paymentMethodLabels[$methodFilter] : '',
+    ]);
+    xlsxDownload(
+        'afterbill-payments' . ($monthFilter !== '' ? '-' . $monthFilter : '') . '.xlsx',
+        'Payments',
+        'AfterBill — Payment History',
+        ($_SESSION['user_name'] ?? '') . ' · exported ' . date('F j, Y g:i A') . ' · ' . count($rows) . ' payment'
+            . (count($rows) === 1 ? '' : 's') . ' · ' . implode(' · ', $filters),
+        [
+            ['label' => 'Paid On', 'type' => 'date', 'width' => 14],
+            ['label' => 'Bill', 'type' => 'strong', 'width' => 30],
+            ['label' => 'Category', 'type' => 'text', 'width' => 18],
+            ['label' => 'Bill Due', 'type' => 'date', 'width' => 14],
+            ['label' => 'Amount Paid', 'type' => 'money', 'width' => 15],
+            ['label' => 'Method', 'type' => 'text', 'width' => 15],
+            ['label' => 'Timing', 'type' => 'status', 'width' => 12],
+            ['label' => 'Notes', 'type' => 'text', 'width' => 32],
+            ['label' => 'Receipt', 'type' => 'text', 'width' => 10],
+        ],
+        $rows,
+        ['Total', null, null, null, round($sum, 2), null, null, null, null]
+    );
+}
+
 $totalPaid = 0.0;
 $lateCount = 0;
 $byMethod = [];
@@ -92,7 +139,12 @@ foreach ($payments as $p) {
 arsort($byMethod);
 $topMethod = $byMethod ? $paymentMethodLabels[array_key_first($byMethod)] : '—';
 
+// One-time message from attach_receipt.php.
+$receiptError = $_SESSION['flash_receipt_error'] ?? null;
+unset($_SESSION['flash_receipt_error']);
+
 $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' => $methodFilter, 'export' => 'csv']));
+$xlsxQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' => $methodFilter, 'export' => 'xlsx']));
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -105,6 +157,19 @@ $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' 
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="assets/css/app.css">
+    <style>
+        .btn-csv { font-size: 0.78rem; font-weight: 600; color: var(--text-muted); text-decoration: none; padding: 6px 4px; }
+        .btn-csv:hover { color: var(--electric-blue); text-decoration: underline; }
+        .receipt-link { color: var(--electric-blue); font-weight: 600; text-decoration: none; white-space: nowrap; }
+        .receipt-link:hover { text-decoration: underline; }
+        .receipt-actions { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 2px; }
+        .receipt-upload { position: relative; overflow: hidden; cursor: pointer; font-size: 0.75rem; font-weight: 600; color: var(--text-muted); white-space: nowrap; }
+        .receipt-upload:hover { color: var(--electric-blue); }
+        .receipt-upload input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; font-size: 0; }
+        .receipt-upload:focus-within { outline: 2px solid var(--electric-blue); outline-offset: 2px; border-radius: 4px; }
+        .receipt-remove { background: none; border: none; padding: 0; cursor: pointer; font: inherit; font-size: 0.75rem; font-weight: 600; color: var(--text-muted); }
+        .receipt-remove:hover { color: var(--danger); }
+    </style>
 </head>
 <body>
 <div class="app">
@@ -118,12 +183,13 @@ $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' 
                 <p><?= count($payments) ?> payment<?= count($payments) === 1 ? '' : 's' ?> recorded</p>
             </div>
             <div class="topbar-right">
-                <a href="payments.php?<?= htmlspecialchars($exportQuery) ?>" class="btn-primary">
+                <a href="payments.php?<?= htmlspecialchars($xlsxQuery) ?>" class="btn-primary" title="Download as a formatted Excel file">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/>
                     </svg>
-                    Export CSV
+                    Export Excel
                 </a>
+                <a href="payments.php?<?= htmlspecialchars($exportQuery) ?>" class="btn-csv" title="Plain CSV, for importing into other apps">CSV</a>
                 <?php require __DIR__ . '/partials/logout-button.php'; ?>
             </div>
         </header>
@@ -131,7 +197,15 @@ $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' 
         <main class="page-body">
 
             <?php if (isset($_GET['unpaid'])): ?>
-                <div class="alert alert-success">Payment removed. The bill is unpaid again.</div>
+                <div class="alert alert-success">Payment removed. Its amount is back on the bill's balance.</div>
+            <?php endif; ?>
+            <?php if (($_GET['receipt'] ?? '') === 'attached'): ?>
+                <div class="alert alert-success">Receipt attached.</div>
+            <?php elseif (($_GET['receipt'] ?? '') === 'removed'): ?>
+                <div class="alert alert-success">Receipt removed.</div>
+            <?php endif; ?>
+            <?php if ($receiptError !== null): ?>
+                <div class="alert alert-error"><?= htmlspecialchars($receiptError) ?></div>
             <?php endif; ?>
             <?php if (isset($_GET['error'])): ?>
                 <div class="alert alert-error">Could not remove that payment. Please try again.</div>
@@ -190,7 +264,7 @@ $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' 
                                     <th>Category</th>
                                     <th>Amount Paid</th>
                                     <th>Method</th>
-                                    <th>Notes</th>
+                                    <th>Notes / Receipt</th>
                                     <th>Actions</th>
                                 </tr>
                             </thead>
@@ -209,10 +283,38 @@ $exportQuery = http_build_query(array_filter(['month' => $monthFilter, 'method' 
                                         <td><?= htmlspecialchars($p['category_name']) ?></td>
                                         <td class="strong">₱<?= number_format((float)$p['amount_paid'], 2) ?></td>
                                         <td><?= $paymentMethodLabels[$p['payment_method']] ?></td>
-                                        <td class="muted"><?= $p['notes'] !== null ? htmlspecialchars($p['notes']) : '—' ?></td>
+                                        <td class="muted">
+                                            <?= $p['notes'] !== null ? htmlspecialchars($p['notes']) : '' ?>
+                                            <?= $p['notes'] !== null || $p['receipt_file'] !== null ? '<br>' : '' ?>
+                                            <span class="receipt-actions">
+                                                <?php if ($p['receipt_file'] !== null): ?>
+                                                    <a href="receipt.php?payment_id=<?= (int)$p['payment_id'] ?>" target="_blank" rel="noopener"
+                                                       class="receipt-link">📎 Receipt</a>
+                                                <?php endif; ?>
+                                                <?php if ($receiptsReady): ?>
+                                                    <form method="POST" action="attach_receipt.php" enctype="multipart/form-data" class="inline-form">
+                                                        <?= csrf_field() ?>
+                                                        <input type="hidden" name="payment_id" value="<?= (int)$p['payment_id'] ?>">
+                                                        <label class="receipt-upload" title="JPG, PNG, WebP or PDF, up to 5 MB">
+                                                            <?= $p['receipt_file'] !== null ? 'Replace' : '+ Attach receipt' ?>
+                                                            <input type="file" name="receipt" accept="image/jpeg,image/png,image/webp,application/pdf" data-autosubmit>
+                                                        </label>
+                                                    </form>
+                                                    <?php if ($p['receipt_file'] !== null): ?>
+                                                        <form method="POST" action="attach_receipt.php" class="inline-form"
+                                                              data-confirm="Delete this receipt? The payment itself is kept.">
+                                                            <?= csrf_field() ?>
+                                                            <input type="hidden" name="payment_id" value="<?= (int)$p['payment_id'] ?>">
+                                                            <input type="hidden" name="remove" value="1">
+                                                            <button type="submit" class="receipt-remove">Remove</button>
+                                                        </form>
+                                                    <?php endif; ?>
+                                                <?php endif; ?>
+                                            </span>
+                                        </td>
                                         <td>
                                             <form method="POST" action="undo_payment.php" class="inline-form"
-                                                data-confirm="Remove this payment? The bill will go back to unpaid.">
+                                                data-confirm="Remove this payment? Its amount goes back onto the bill's balance and any receipt is deleted.">
                                                 <input type="hidden" name="payment_id" value="<?= (int)$p['payment_id'] ?>">
                                                 <input type="hidden" name="return" value="payments">
                                                 <?= csrf_field() ?>

@@ -14,6 +14,7 @@ if (auth_check()) {
 require_once __DIR__ . '/../includes/csrf.php';
 require_once __DIR__ . '/../includes/activity.php';
 require_once __DIR__ . '/../includes/rate_limit.php';
+require_once __DIR__ . '/../includes/two_factor.php';
 
 $errors = [];
 $needsVerification = false;
@@ -58,6 +59,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // Checked only after the password, so this can't be used to probe accounts.
                 $errors[] = 'Please verify your email address first: open the link we emailed you when you registered.';
                 $needsVerification = true;
+            } elseif ($user && password_verify($password, $user['password']) && twoFactorEnabled($pdo, (int)$user['id'])) {
+                // Password is right, but the account also needs a code from the authenticator app.
+                // Not signed in yet: auth/two_factor.php finishes the login. New session id here
+                // too, so a planted session id can't ride along into the second step.
+                session_regenerate_id(true);
+                $_SESSION['two_factor_pending'] = [
+                    'user_id' => (int)$user['id'],
+                    'name'    => $user['full_name'],
+                    'fp'      => auth_fingerprint($user['password']),
+                    'at'      => time(),
+                    'tries'   => 0,
+                ];
+                header('Location: two_factor.php');
+                exit;
             } elseif ($user && password_verify($password, $user['password'])) {
                 // New session id (session fixation guard) + password fingerprint (includes/auth.php).
                 auth_login_session((int)$user['id'], $user['full_name'], $user['password']);

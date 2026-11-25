@@ -10,14 +10,17 @@ require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/csrf.php';
 require_once __DIR__ . '/includes/activity.php';
 require_once __DIR__ . '/includes/budgets.php';
+require_once __DIR__ . '/includes/categories.php';
+require_once __DIR__ . '/includes/recurring_bills.php'; // + recurrence.php
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
 
 $pdo = getPDO();
-$categories = $pdo->query('SELECT category_id, category_name FROM categories ORDER BY category_id')->fetchAll();
+$categories = userCategories($pdo, (int)$_SESSION['user_id']); // built-ins + this user's own
 
 $errors = [];
+$repeat = readRepeatFields([], false, '');
 $old = [
     'bill_name'    => '',
     'amount'       => '',
@@ -62,20 +65,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors[] = 'Please select a valid category.';
     }
 
+    $validDue = $dueDateObj && $dueDateObj->format('Y-m-d') === $dueDate ? $dueDate : '';
+    $repeat = readRepeatFields($_POST, $isRecurring, $validDue);
+    $errors = array_merge($errors, $repeat['errors']);
+
     if (empty($errors)) {
         try {
-            $stmt = $pdo->prepare(
-                'INSERT INTO bills (user_id, bill_name, amount, due_date, category_id, is_recurring, status)
-                 VALUES (?, ?, ?, ?, ?, ?, \'unpaid\')'
-            );
-            $stmt->execute([
+            $values = [
                 $_SESSION['user_id'],
                 $billName,
                 (float)$amount,
                 $dueDate,
                 (int)$categoryId,
                 $isRecurring ? 1 : 0,
-            ]);
+            ];
+            $withRepeat = recurrenceColumnsExist($pdo); // migration 005
+            if ($withRepeat) {
+                array_push($values, $repeat['interval'], $isRecurring ? $repeat['until'] : null);
+            }
+            $stmt = $pdo->prepare($withRepeat
+                ? 'INSERT INTO bills (user_id, bill_name, amount, due_date, category_id, is_recurring, status, repeat_interval, repeat_until)
+                   VALUES (?, ?, ?, ?, ?, ?, \'unpaid\', ?, ?)'
+                : 'INSERT INTO bills (user_id, bill_name, amount, due_date, category_id, is_recurring, status)
+                   VALUES (?, ?, ?, ?, ?, ?, \'unpaid\')'
+            );
+            $stmt->execute($values);
 
             $userId = (int)$_SESSION['user_id'];
             logActivity($pdo, $userId, 'bill_added', sprintf(
@@ -83,7 +97,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $billName,
                 activityMoney((float)$amount),
                 $dueDateObj->format('M j, Y'),
-                $isRecurring ? ' (monthly)' : ''
+                $isRecurring ? ' (' . strtolower(repeatLabel($repeat['interval'], $repeat['until'])) . ')' : ''
             ));
             // Shown once on bills.php if this bill pushed its category over budget.
             $budgetWarning = budgetWarningFor($pdo, $userId, (int)$categoryId, $dueDate);
@@ -389,13 +403,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 </option>
                             <?php endforeach; ?>
                         </select>
+                        <a href="categories.php" style="display:inline-block;margin-top:6px;font-size:0.78rem;color:var(--electric-blue);text-decoration:none;">+ Manage categories</a>
                     </div>
 
-                    <div class="form-check">
-                        <input type="checkbox" id="is_recurring" name="is_recurring" value="1"
-                            <?= $old['is_recurring'] ? 'checked' : '' ?>>
-                        <label for="is_recurring">This bill repeats every month</label>
-                    </div>
+                    <?php include __DIR__ . '/partials/repeat-fields.php'; ?>
 
                     <div class="form-actions">
                         <button type="submit" class="btn-primary">

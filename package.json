@@ -1,0 +1,27 @@
+{
+  "name": "afterbill",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "test": "cypress run",
+    "cy:open": "cypress open",
+    "cy:run": "cypress run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elmiraclee/sqa-afterbill.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/elmiraclee/sqa-afterbill/issues"
+  },
+  "homepage": "https://github.com/elmiraclee/sqa-afterbill#readme",
+  "devDependencies": {
+    "bcryptjs": "^3.0.3",
+    "cypress": "^16.2.1",
+    "mysql2": "^3.24.6"
+  }
+}

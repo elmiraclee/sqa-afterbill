@@ -1,0 +1,2 @@
+# Scheduled scripts run from the command line only — never over HTTP.
+Require all denied

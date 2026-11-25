@@ -11,6 +11,10 @@ require_once __DIR__ . '/includes/csrf.php';
 require_once __DIR__ . '/includes/activity.php';
 require_once __DIR__ . '/includes/password_policy.php';
 require_once __DIR__ . '/includes/auth_tokens.php';
+require_once __DIR__ . '/includes/payments.php';
+require_once __DIR__ . '/includes/reminders.php';
+require_once __DIR__ . '/includes/two_factor.php';
+require_once __DIR__ . '/includes/data_export.php';
 
 $pdo = getPDO();
 $userId = (int)$_SESSION['user_id'];
@@ -174,6 +178,163 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'passw
     }
 }
 
+$reminderErrors = [];
+$reminders = reminderSettings($pdo, $userId); // null = migration 004 not run
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'reminders') {
+    $enabled = ($_POST['reminder_emails'] ?? '') === '1';
+    $days = $_POST['reminder_days'] ?? '';
+
+    if (!csrf_valid()) {
+        $reminderErrors[] = CSRF_ERROR;
+    }
+    if ($reminders === null) {
+        $reminderErrors[] = 'Email reminders are not set up in this database yet. Run database/migrations/004_categories_payments_reminders.sql.';
+    }
+    if (!ctype_digit((string)$days) || !in_array((int)$days, REMINDER_DAY_CHOICES, true)) {
+        $reminderErrors[] = 'Please choose how many days ahead to be reminded.';
+    }
+
+    if (empty($reminderErrors)) {
+        try {
+            $pdo->prepare('UPDATE users SET reminder_emails = ?, reminder_days = ? WHERE id = ?')
+                ->execute([$enabled ? 1 : 0, (int)$days, $userId]);
+            if ($enabled !== $reminders['enabled'] || (int)$days !== $reminders['days']) {
+                logActivity($pdo, $userId, 'reminders_updated', $enabled
+                    ? 'Email reminders on — ' . (int)$days . ' day' . ((int)$days === 1 ? '' : 's') . ' ahead'
+                    : 'Email reminders off');
+            }
+            header('Location: account.php?updated=reminders#reminders');
+            exit;
+        } catch (PDOException $e) {
+            $reminderErrors[] = 'Could not save your reminder settings. Please try again later.';
+        }
+    }
+    // Show what was submitted again.
+    if ($reminders !== null) {
+        $reminders['enabled'] = $enabled;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two-factor login, signed-in devices, data export
+// ---------------------------------------------------------------------------------------------
+$securityErrors = [];   // shown in the panel named by $securityPanel
+$securityPanel = '';
+$action = $_POST['action'] ?? '';
+$twoFactorReady = true; // migration 005 run?
+try {
+    $tf = $pdo->prepare('SELECT totp_enabled_at FROM users WHERE id = ?');
+    $tf->execute([$userId]);
+    $twoFactorOn = $tf->fetchColumn() !== null;
+} catch (PDOException $e) {
+    $twoFactorReady = false;
+    $twoFactorOn = false;
+}
+$passwordOk = fn() => password_verify((string)($_POST['current_password'] ?? ''), $user['password']);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && in_array($action,
+        ['2fa_start', '2fa_cancel', '2fa_enable', '2fa_disable', '2fa_recovery', 'revoke_session', 'revoke_others', 'export_data'], true)) {
+    $securityPanel = str_starts_with($action, '2fa') ? 'two-factor' : ($action === 'export_data' ? 'export' : 'devices');
+
+    if (!csrf_valid()) {
+        $securityErrors[] = CSRF_ERROR;
+    } elseif (!$twoFactorReady && $action !== 'export_data') {
+        $securityErrors[] = 'This is not set up in this database yet. Run database/migrations/005_more_features.sql.';
+    } elseif ($action === '2fa_start' && !$twoFactorOn) {
+        // The secret lives only in the session until the user proves their app works.
+        $_SESSION['totp_setup'] = ['secret' => totpNewSecret(), 'at' => time()];
+        header('Location: account.php#two-factor');
+        exit;
+    } elseif ($action === '2fa_cancel') {
+        unset($_SESSION['totp_setup']);
+        header('Location: account.php#two-factor');
+        exit;
+    } elseif ($action === '2fa_enable' && !$twoFactorOn) {
+        $setup = $_SESSION['totp_setup'] ?? null;
+        $step = null;
+        if (!is_array($setup) || time() - (int)$setup['at'] > 1800) {
+            unset($_SESSION['totp_setup']);
+            $securityErrors[] = 'The setup expired. Click "Set up two-factor login" to start again.';
+        } elseif (!$passwordOk()) {
+            $securityErrors[] = 'Current password is incorrect.';
+        } elseif (($step = totpMatchStep($setup['secret'], (string)($_POST['code'] ?? ''))) === null) {
+            $securityErrors[] = 'That code didn\'t match. Make sure you scanned the code above and type the newest 6-digit code.';
+        }
+        if (empty($securityErrors)) {
+            $pdo->beginTransaction();
+            $pdo->prepare('UPDATE users SET totp_secret = ?, totp_enabled_at = NOW(), totp_last_step = ? WHERE id = ?')
+                ->execute([$setup['secret'], $step, $userId]);
+            $_SESSION['flash_recovery_codes'] = recoveryCodesRegenerate($pdo, $userId);
+            $pdo->commit();
+            unset($_SESSION['totp_setup']);
+            logActivity($pdo, $userId, 'two_factor_enabled');
+            header('Location: account.php?updated=2fa_on#two-factor');
+            exit;
+        }
+    } elseif ($action === '2fa_disable' && $twoFactorOn) {
+        if (!$passwordOk()) {
+            $securityErrors[] = 'Current password is incorrect.';
+        } elseif (twoFactorVerify($pdo, $userId, (string)($_POST['code'] ?? '')) === null) {
+            $securityErrors[] = 'Enter a current code from your authenticator app (or a recovery code) to turn this off.';
+        } else {
+            $pdo->prepare('UPDATE users SET totp_secret = NULL, totp_enabled_at = NULL, totp_last_step = NULL WHERE id = ?')->execute([$userId]);
+            $pdo->prepare('DELETE FROM user_recovery_codes WHERE user_id = ?')->execute([$userId]);
+            logActivity($pdo, $userId, 'two_factor_disabled');
+            header('Location: account.php?updated=2fa_off#two-factor');
+            exit;
+        }
+    } elseif ($action === '2fa_recovery' && $twoFactorOn) {
+        if (!$passwordOk()) {
+            $securityErrors[] = 'Current password is incorrect.';
+        } else {
+            $_SESSION['flash_recovery_codes'] = recoveryCodesRegenerate($pdo, $userId);
+            logActivity($pdo, $userId, 'recovery_codes_regenerated');
+            header('Location: account.php?updated=2fa_codes#two-factor');
+            exit;
+        }
+    } elseif ($action === 'revoke_session' || $action === 'revoke_others') {
+        $id = $_POST['session_id'] ?? '';
+        if ($action === 'revoke_session' && !ctype_digit((string)$id)) {
+            $securityErrors[] = 'Unknown device.';
+        } else {
+            $n = sessionRevoke($pdo, $userId, $action === 'revoke_session' ? (int)$id : null);
+            if ($n > 0) {
+                logActivity($pdo, $userId, 'sessions_revoked', $n . ' device' . ($n === 1 ? '' : 's') . ' signed out');
+            }
+            header('Location: account.php?updated=devices&n=' . $n . '#devices');
+            exit;
+        }
+    } elseif ($action === 'export_data') {
+        if (!$passwordOk()) {
+            $securityErrors[] = 'Current password is incorrect.';
+        } else {
+            try {
+                $zipPath = buildDataExport($pdo, $userId);
+                logActivity($pdo, $userId, 'data_exported');
+                header('Content-Type: application/zip');
+                header('Content-Disposition: attachment; filename="afterbill-my-data-' . date('Y-m-d') . '.zip"');
+                header('Content-Length: ' . filesize($zipPath));
+                header('Cache-Control: private, no-store');
+                readfile($zipPath);
+                @unlink($zipPath);
+                exit;
+            } catch (RuntimeException $e) {
+                error_log('AfterBill export failed: ' . $e->getMessage());
+                $securityErrors[] = 'Could not build your download. Please try again later.';
+            }
+        }
+    }
+}
+
+$totpSetup = !$twoFactorOn && is_array($_SESSION['totp_setup'] ?? null) ? $_SESSION['totp_setup'] : null;
+$recoveryCodes = $_SESSION['flash_recovery_codes'] ?? null; // shown exactly once
+unset($_SESSION['flash_recovery_codes']);
+$recoveryUsedLeft = $_SESSION['flash_recovery_used'] ?? null;
+unset($_SESSION['flash_recovery_used']);
+$recoveryLeft = $twoFactorOn ? recoveryCodesLeft($pdo, $userId) : 0;
+$devices = sessionList($pdo, $userId, (string)$_SESSION['auth_fp']);
+
 $deleteErrors = [];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delete_account') {
@@ -191,14 +352,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delet
 
     if (empty($deleteErrors)) {
         try {
-            // Everything the user owns goes with the row: bills (→ payments), budgets and the
-            // activity log all reference users with ON DELETE CASCADE. Recurring-bill links are
-            // cleared first so MySQL never has to cascade through a bill that points at another
-            // bill being deleted in the same statement.
+            // Receipt files aren't rows, so note them before the payments disappear.
+            try {
+                $files = $pdo->prepare(
+                    'SELECT p.receipt_file FROM payments p JOIN bills b ON b.bill_id = p.bill_id
+                     WHERE b.user_id = ? AND p.receipt_file IS NOT NULL'
+                );
+                $files->execute([$userId]);
+                $receiptFiles = $files->fetchAll(PDO::FETCH_COLUMN);
+            } catch (PDOException $e) {
+                $receiptFiles = []; // migration 004 not run: no receipts
+            }
+
+            // Everything the user owns goes with the row: bills (→ payments), budgets, custom
+            // categories and the activity log all reference users with ON DELETE CASCADE.
+            // Recurring-bill links are cleared first so MySQL never has to cascade through a bill
+            // that points at another bill being deleted in the same statement. Bills and budgets
+            // are deleted explicitly before the user, because they also point at the user's
+            // custom categories, and the cascade order between those tables isn't guaranteed.
             $pdo->beginTransaction();
             $pdo->prepare('UPDATE bills SET parent_bill_id = NULL WHERE user_id = ?')->execute([$userId]);
+            $pdo->prepare('DELETE FROM bills WHERE user_id = ?')->execute([$userId]);
+            $pdo->prepare('DELETE FROM budgets WHERE user_id = ?')->execute([$userId]);
             $pdo->prepare('DELETE FROM users WHERE id = ?')->execute([$userId]);
             $pdo->commit();
+
+            foreach ($receiptFiles as $file) {
+                deleteReceiptFile($file);
+            }
 
             auth_end_session('deleted');
             header('Location: auth/login.php?reason=deleted');
@@ -368,7 +549,8 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
 
         .form-group input[type="text"],
         .form-group input[type="email"],
-        .form-group input[type="password"] {
+        .form-group input[type="password"],
+        .form-group select {
             width: 100%;
             padding: 10px 12px;
             border: 1.5px solid var(--border);
@@ -427,6 +609,7 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
         .alert-error { background: #FEF2F2; color: #B91C1C; }
         .alert-error ul { margin: 4px 0 0 18px; }
         .alert-info { background: #EFF6FF; color: #1D4ED8; }
+        .alert-warning { background: #FFFBEB; color: #B45309; }
 
         @media (max-width: 680px) {
             .sidebar { transform: translateX(-100%); }
@@ -572,9 +755,57 @@ $memberSince = (new DateTime($user['created_at']))->format('F j, Y');
                 </form>
             </div>
 
+            <?php include __DIR__ . '/partials/account-security.php'; ?>
+
+            <?php if ($reminders !== null): ?>
+            <div class="form-panel" id="reminders">
+                <h1>Email Reminders</h1>
+                <p>Get one email a day listing bills that are overdue or coming up, sent to <?= htmlspecialchars($user['email']) ?>. No email on days when nothing is due.</p>
+
+                <?php if (($_GET['updated'] ?? '') === 'reminders'): ?>
+                    <div class="alert alert-success">Reminder settings saved.</div>
+                <?php endif; ?>
+
+                <?php if (!empty($reminderErrors)): ?>
+                    <div class="alert alert-error">
+                        <ul>
+                            <?php foreach ($reminderErrors as $err): ?>
+                                <li><?= htmlspecialchars($err) ?></li>
+                            <?php endforeach; ?>
+                        </ul>
+                    </div>
+                <?php endif; ?>
+
+                <form method="POST" action="#reminders" novalidate>
+                    <input type="hidden" name="action" value="reminders">
+                    <?= csrf_field() ?>
+
+                    <label class="confirm-check">
+                        <input type="checkbox" name="reminder_emails" value="1" <?= $reminders['enabled'] ? 'checked' : '' ?>>
+                        Email me about unpaid bills
+                    </label>
+
+                    <div class="form-group">
+                        <label for="reminder_days">Remind me about bills due within</label>
+                        <select id="reminder_days" name="reminder_days">
+                            <?php foreach (REMINDER_DAY_CHOICES as $choice): ?>
+                                <option value="<?= $choice ?>" <?= $reminders['days'] === $choice ? 'selected' : '' ?>>
+                                    <?= $choice ?> day<?= $choice === 1 ? '' : 's' ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="submit" class="btn-primary">Save Reminder Settings</button>
+                    </div>
+                </form>
+            </div>
+            <?php endif; ?>
+
             <div class="form-panel danger-panel" id="delete-account">
                 <h1>Delete Account</h1>
-                <p>Permanently delete your account and everything in it: all bills, payments, budgets and your activity log. This cannot be undone.</p>
+                <p>Permanently delete your account and everything in it: all bills, payments and receipts, budgets, custom categories and your activity log. Want a copy first? Use <a href="#export">Download My Data</a>. This cannot be undone.</p>
 
                 <?php if (!empty($deleteErrors)): ?>
                     <div class="alert alert-error">

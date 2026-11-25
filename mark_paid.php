@@ -1,6 +1,9 @@
 <?php
 /**
- * AfterBill - Mark Bill as Paid
+ * AfterBill - Record a Payment (full or partial), with an optional receipt
+ *
+ * The bill turns 'paid' once its payments add up to its amount (includes/payments.php); a smaller
+ * payment leaves it partially paid with the rest still owed.
  */
 
 require_once __DIR__ . '/includes/auth.php';
@@ -9,6 +12,7 @@ require_login(); // session check, idle timeout, sign-out after a password chang
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/csrf.php';
 require_once __DIR__ . '/includes/activity.php';
+require_once __DIR__ . '/includes/payments.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -34,6 +38,16 @@ if (!$bill || $bill['status'] !== 'unpaid') {
     exit;
 }
 
+$paidSoFar = billPaidTotal($pdo, $billId);
+$balanceCents = toCents($bill['amount']) - toCents($paidSoFar);
+// Payments already cover it (e.g. the amount was lowered): fix the status instead of taking more.
+if ($balanceCents <= 0) {
+    refreshBillStatus($pdo, $billId);
+    header('Location: bills.php');
+    exit;
+}
+$balance = $balanceCents / 100;
+
 $paymentMethods = ['cash', 'bank_transfer', 'gcash', 'debit_card', 'credit_card', 'other'];
 $paymentMethodLabels = [
     'cash'          => 'Cash',
@@ -47,7 +61,7 @@ $paymentMethodLabels = [
 $errors = [];
 $old = [
     'payment_date'   => date('Y-m-d'),
-    'amount_paid'    => number_format((float)$bill['amount'], 2, '.', ''),
+    'amount_paid'    => number_format($balance, 2, '.', ''),
     'payment_method' => '',
     'notes'          => '',
 ];
@@ -74,8 +88,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors[] = 'Payment date cannot be in the future.';
     }
 
-    if (!is_numeric($amountPaid) || (float)$amountPaid <= 0 || (float)$amountPaid > 99999999.99) {
+    if (!is_numeric($amountPaid) || toCents($amountPaid) < 1 || (float)$amountPaid > 99999999.99) {
         $errors[] = 'Please enter a valid amount paid greater than 0.';
+    } elseif (toCents($amountPaid) > $balanceCents) {
+        $errors[] = 'Amount paid can\'t be more than the ₱' . number_format($balance, 2)
+            . ' still owed. If a fee was added, edit the bill amount first.';
     }
 
     if (!in_array($paymentMethod, $paymentMethods, true)) {
@@ -86,37 +103,77 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors[] = 'Notes must be 255 characters or fewer.';
     }
 
+    // Optional receipt. A form bigger than post_max_size arrives with $_POST and $_FILES empty,
+    // which the checks above already report (no CSRF token, no date...).
+    [$receiptExt, $receiptError] = checkReceiptUpload($_FILES['receipt'] ?? null);
+    if ($receiptError !== null) {
+        $errors[] = $receiptError;
+    }
+
+    $receiptFile = null;
+    if (empty($errors) && $receiptExt !== null) {
+        $receiptFile = storeReceipt($_FILES['receipt']['tmp_name'], $receiptExt);
+        if ($receiptFile === null) {
+            $errors[] = 'The receipt could not be saved. Please try again, or record the payment without it.';
+        }
+    }
+
     if (empty($errors)) {
         try {
             $pdo->beginTransaction();
 
-            $insert = $pdo->prepare(
-                'INSERT INTO payments (bill_id, payment_date, amount_paid, payment_method, notes)
-                 VALUES (?, ?, ?, ?, ?)'
-            );
-            $insert->execute([
+            // Lock the bill and re-check the balance inside the transaction, so two payments
+            // submitted at the same moment can't together pay more than is owed.
+            $lock = $pdo->prepare('SELECT amount, status FROM bills WHERE bill_id = ? AND user_id = ? FOR UPDATE');
+            $lock->execute([$bill['bill_id'], $_SESSION['user_id']]);
+            $locked = $lock->fetch();
+            $owedCents = $locked ? toCents($locked['amount']) - toCents(billPaidTotal($pdo, $billId)) : 0;
+            if (!$locked || $locked['status'] !== 'unpaid' || toCents($amountPaid) > $owedCents) {
+                $pdo->rollBack();
+                deleteReceiptFile($receiptFile);
+                header('Location: bills.php');
+                exit;
+            }
+
+            $values = [
                 $bill['bill_id'],
                 $paymentDate,
-                (float)$amountPaid,
+                round((float)$amountPaid, 2),
                 $paymentMethod,
                 $notes !== '' ? $notes : null,
-            ]);
+            ];
+            // receipt_file only when there is one, so payments keep working on a database that
+            // hasn't had migration 004 yet (a receipt upload there fails and is reported).
+            if ($receiptFile !== null) {
+                $values[] = $receiptFile;
+            }
+            $insert = $pdo->prepare(
+                'INSERT INTO payments (bill_id, payment_date, amount_paid, payment_method, notes'
+                . ($receiptFile !== null ? ', receipt_file) VALUES (?, ?, ?, ?, ?, ?)' : ') VALUES (?, ?, ?, ?, ?)')
+            );
+            $insert->execute($values);
 
-            $update = $pdo->prepare('UPDATE bills SET status = \'paid\' WHERE bill_id = ? AND user_id = ?');
-            $update->execute([$bill['bill_id'], $_SESSION['user_id']]);
+            $newStatus = refreshBillStatus($pdo, $billId);
 
             $pdo->commit();
+
+            $leftCents = $owedCents - toCents($amountPaid);
             logActivity($pdo, (int)$_SESSION['user_id'], 'payment_recorded', sprintf(
-                '%s — %s via %s',
+                '%s — %s via %s%s%s',
                 $bill['bill_name'],
                 activityMoney((float)$amountPaid),
-                $paymentMethodLabels[$paymentMethod]
+                $paymentMethodLabels[$paymentMethod],
+                $newStatus === 'paid' ? '' : ', ' . activityMoney($leftCents / 100) . ' left',
+                $receiptFile !== null ? ' · receipt attached' : ''
             ));
 
-            header('Location: bills.php?paid=1');
+            header('Location: bills.php?' . ($newStatus === 'paid' ? 'paid=1' : 'partial=1'));
             exit;
         } catch (PDOException $e) {
-            $pdo->rollBack();
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            deleteReceiptFile($receiptFile);
             $errors[] = 'Failed to record the payment. Please try again later.';
         }
     }
@@ -127,7 +184,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mark as Paid – AfterBill</title>
+    <title><?= $paidSoFar > 0 ? 'Add Payment' : 'Mark as Paid' ?> – AfterBill</title>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233B82F6'/%3E%3Ctext x='16' y='22' font-family='Arial,sans-serif' font-size='16' font-weight='bold' fill='white' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -284,6 +341,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         .bill-summary .bill-name { font-size: 0.88rem; font-weight: 600; color: var(--text-dark); }
         .bill-summary .bill-amount { font-size: 0.95rem; font-weight: 700; color: var(--deep-navy); }
+        .bill-progress { margin: -12px 0 22px; font-size: 0.8rem; color: var(--text-muted); }
+        .bill-progress strong { color: #B45309; }
+        .field-hint { display: block; margin-top: 6px; font-size: 0.75rem; color: var(--text-muted); }
+        .form-group input[type="file"] { width: 100%; font-size: 0.82rem; font-family: inherit; }
 
         .form-group { margin-bottom: 18px; }
         .form-group label { display: block; font-size: 0.82rem; font-weight: 600; color: var(--text-dark); margin-bottom: 6px; }
@@ -371,8 +432,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <div class="main">
         <header class="topbar">
             <div class="topbar-left">
-                <h2>Mark as Paid</h2>
-                <p>Record a payment for this bill.</p>
+                <h2><?= $paidSoFar > 0 ? 'Add Payment' : 'Mark as Paid' ?></h2>
+                <p>Record a full or partial payment for this bill.</p>
             </div>
             <div class="topbar-right">
                 <?php require __DIR__ . '/partials/logout-button.php'; ?>
@@ -382,12 +443,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <main class="page-body">
             <div class="form-panel">
                 <h1>Record Payment</h1>
-                <p>Confirm the payment details for this bill.</p>
+                <p>Pay the full balance, or enter a smaller amount to pay part of it now.</p>
 
                 <div class="bill-summary">
                     <span class="bill-name"><?= htmlspecialchars($bill['bill_name']) ?></span>
                     <span class="bill-amount">₱<?= number_format((float)$bill['amount'], 2) ?></span>
                 </div>
+
+                <?php if ($paidSoFar > 0): ?>
+                    <div class="bill-progress">
+                        ₱<?= number_format($paidSoFar, 2) ?> paid so far · <strong>₱<?= number_format($balance, 2) ?> left to pay</strong>
+                    </div>
+                <?php endif; ?>
 
                 <?php if (!empty($errors)): ?>
                     <div class="alert alert-error">
@@ -400,7 +467,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     </div>
                 <?php endif; ?>
 
-                <form method="POST" action="" novalidate>
+                <form method="POST" action="" enctype="multipart/form-data" novalidate>
                     <?= csrf_field() ?>
                     <input type="hidden" name="bill_id" value="<?= (int)$bill['bill_id'] ?>">
 
@@ -413,7 +480,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <div class="form-group">
                         <label for="amount_paid">Amount Paid (₱)</label>
                         <input type="number" id="amount_paid" name="amount_paid" step="0.01" min="0.01"
+                            max="<?= number_format($balance, 2, '.', '') ?>"
                             value="<?= htmlspecialchars($old['amount_paid']) ?>" required>
+                        <span class="field-hint">Balance: ₱<?= number_format($balance, 2) ?>. A smaller amount records a partial payment.</span>
                     </div>
 
                     <div class="form-group">
@@ -432,6 +501,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <div class="form-group">
                         <label for="notes">Notes (optional)</label>
                         <textarea id="notes" name="notes" maxlength="255"><?= htmlspecialchars($old['notes']) ?></textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="receipt">Receipt (optional)</label>
+                        <input type="file" id="receipt" name="receipt" accept="image/jpeg,image/png,image/webp,application/pdf">
+                        <span class="field-hint">JPG, PNG, WebP or PDF, up to 5 MB. Only you can see it.</span>
                     </div>
 
                     <div class="form-actions">

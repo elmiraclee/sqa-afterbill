@@ -27,41 +27,25 @@ if ($hour >= 5 && $hour < 12) {
 // Dashboard stats (FR-04)
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/recurring_bills.php';
+require_once __DIR__ . '/includes/payments.php';
+require_once __DIR__ . '/includes/charts.php';
 $pdo = getPDO();
 
 // Catch up any recurring bills whose cycle has passed before computing stats, so newly
 // generated bills are reflected immediately.
 generateMissedRecurringBills($pdo, (int)$_SESSION['user_id']);
 
-// Bills due this calendar month, grouped by status: one query gives count + sum per status.
-$monthStmt = $pdo->prepare(
-    'SELECT status, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
-     FROM bills
-     WHERE user_id = ?
-       AND YEAR(due_date) = YEAR(CURDATE())
-       AND MONTH(due_date) = MONTH(CURDATE())
-     GROUP BY status'
-);
-$monthStmt->execute([$_SESSION['user_id']]);
-$monthRows = $monthStmt->fetchAll();
+// Bills due this calendar month, counting money actually paid: a partially paid bill adds what
+// was paid to "paid" and the rest to "unpaid" (includes/payments.php → billTotals()).
+$month = billTotals($pdo, (int)$_SESSION['user_id'], date('Y-m-01'), date('Y-m-t'));
+$paidCount = $month['paid_count'];
+$partialCount = $month['partial_count'];
+$unpaidCount = $month['unpaid_count'] + $month['partial_count']; // bills with something still owed
+$paidSum = $month['paid'];
+$unpaidSum = $month['unpaid'];
 
-$paidCount = 0;
-$paidSum = 0.0;
-$unpaidCount = 0;
-$unpaidSum = 0.0;
-
-foreach ($monthRows as $row) {
-    if ($row['status'] === 'paid') {
-        $paidCount = (int)$row['cnt'];
-        $paidSum = (float)$row['total'];
-    } elseif ($row['status'] === 'unpaid') {
-        $unpaidCount = (int)$row['cnt'];
-        $unpaidSum = (float)$row['total'];
-    }
-}
-
-$billsThisMonth = $paidCount + $unpaidCount;
-$monthlyTotalExpenses = $paidSum + $unpaidSum;
+$billsThisMonth = $month['count'];
+$monthlyTotalExpenses = $month['total'];
 
 // Upcoming (next 7 days) and overdue counts among unpaid bills, computed live — not restricted
 // to this month, and "overdue" is never stored, same logic as bills.php.
@@ -77,6 +61,29 @@ $rangeRow = $rangeStmt->fetch();
 
 $upcomingCount = (int)($rangeRow['upcoming_count'] ?? 0);
 $overdueCount = (int)($rangeRow['overdue_count'] ?? 0);
+
+// Last 6 months (this month + the 5 before): paid vs still owed per month, by due date. Same
+// numbers as the Reports history chart (billTotals()).
+$trendStart = (new DateTime(date('Y-m-01')))->modify('-5 months');
+$trendRows = billTotals($pdo, (int)$_SESSION['user_id'], $trendStart->format('Y-m-d'), date('Y-m-t'), true);
+$trend = [];
+$trendMax = 0.0;
+for ($i = 0; $i < 6; $i++) {
+    $m = (clone $trendStart)->modify("+$i months");
+    $t = $trendRows[$m->format('Y-m')] ?? ['paid' => 0.0, 'unpaid' => 0.0, 'total' => 0.0, 'count' => 0];
+    $trend[] = ['key' => $m->format('Y-m'), 'short' => $m->format('M'), 'label' => $m->format('F Y'),
+                'paid' => $t['paid'], 'owed' => $t['unpaid'], 'total' => $t['total'], 'count' => $t['count']];
+    $trendMax = max($trendMax, $t['total']);
+}
+$trendHasData = $trendMax > 0;
+// Geometry (SVG user units, scales to the panel width). Axis rounded up to a nice step, <= 4 lines.
+$tW = 640; $tLeft = 52; $tRight = 628; $tTop = 24; $tBottom = 176;
+$tPlotH = $tBottom - $tTop;
+$tSlot = ($tRight - $tLeft) / 6;
+$tBarW = 36;
+$tStep = $trendHasData ? chartNiceStep($trendMax / 4) : 1;
+$tTicks = max(1, (int)ceil($trendMax / $tStep - 1e-9));
+$tAxisMax = $tStep * $tTicks;
 
 // Actual rows for the "Upcoming Bills" list panel — same 7-day window as $upcomingCount above.
 $upcomingListStmt = $pdo->prepare(
@@ -482,6 +489,35 @@ $upcomingBills = $upcomingListStmt->fetchAll();
             border-radius: 999px;
         }
 
+        .trend-panel { margin-bottom: 28px; }
+        .trend-link { font-size: 0.78rem; font-weight: 600; color: var(--electric-blue); text-decoration: none; }
+        .trend-link:hover { text-decoration: underline; }
+        .trend-empty { padding: 22px; font-size: 0.85rem; color: var(--text-muted); }
+        .trend-chart { padding: 10px 18px 16px; }
+        .trend-chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+        .trend-grid { stroke: #EEF0F3; stroke-width: 1; }
+        .trend-baseline { stroke: #D1D5DB; stroke-width: 1; }
+        .trend-axis { font-size: 11px; fill: var(--text-muted); }
+        .trend-value { font-size: 11px; font-weight: 700; fill: var(--deep-navy); }
+        .trend-month { font-size: 12px; fill: var(--text-dark); }
+        .trend-month.now { font-weight: 700; fill: var(--electric-blue); }
+        .trend-hit { fill: transparent; transition: fill 0.15s; }
+        .trend-col:hover .trend-hit, .trend-col:focus .trend-hit { fill: #F3F4F6; }
+        .trend-col:focus { outline: none; }
+        .trend-col:focus-visible .trend-hit { stroke: var(--electric-blue); stroke-width: 2; }
+        .trend-paid { fill: #10B981; }
+        .trend-owed { fill: #F59E0B; }
+        .trend-legend { display: flex; justify-content: center; gap: 18px; margin-top: 4px; font-size: 0.78rem; color: var(--text-muted); }
+        .trend-key { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+        .trend-key.paid { background: #10B981; }
+        .trend-key.owed { background: #F59E0B; }
+        .trend-table { margin-top: 10px; font-size: 0.8rem; }
+        .trend-table summary { cursor: pointer; color: var(--text-muted); font-weight: 600; }
+        .trend-table table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+        .trend-table th, .trend-table td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+        .trend-table th:first-child, .trend-table td:first-child { text-align: left; }
+        .trend-table th { color: var(--text-muted); font-weight: 600; }
+
         .panel-badge.blue   { background: rgba(59,130,246,0.1); color: var(--electric-blue); }
         .panel-badge.amber  { background: rgba(245,158,11,0.1); color: var(--warning); }
 
@@ -697,7 +733,7 @@ $upcomingBills = $upcomingListStmt->fetchAll();
                     </div>
                     <div class="stat-body">
                         <div class="stat-value">₱<?= number_format($paidSum, 2) ?></div>
-                        <div class="stat-label"><?= $paidCount ?> bill<?= $paidCount === 1 ? '' : 's' ?> paid this month</div>
+                        <div class="stat-label">Paid this month · <?= $paidCount ?> bill<?= $paidCount === 1 ? '' : 's' ?> fully paid</div>
                     </div>
                 </div>
 
@@ -709,7 +745,7 @@ $upcomingBills = $upcomingListStmt->fetchAll();
                     </div>
                     <div class="stat-body">
                         <div class="stat-value">₱<?= number_format($unpaidSum, 2) ?></div>
-                        <div class="stat-label"><?= $unpaidCount ?> bill<?= $unpaidCount === 1 ? '' : 's' ?> unpaid this month</div>
+                        <div class="stat-label">Still owed · <?= $unpaidCount ?> bill<?= $unpaidCount === 1 ? '' : 's' ?><?= $partialCount > 0 ? ' (' . $partialCount . ' partly paid)' : '' ?></div>
                     </div>
                 </div>
 
@@ -748,6 +784,79 @@ $upcomingBills = $upcomingListStmt->fetchAll();
                         <div class="stat-label">Total Expenses This Month</div>
                     </div>
                 </div>
+            </div>
+
+            <!-- Last 6 months -->
+            <div class="panel trend-panel">
+                <div class="panel-header">
+                    <span class="panel-title">Last 6 months</span>
+                    <a href="reports.php" class="trend-link">Full report →</a>
+                </div>
+                <?php if (!$trendHasData): ?>
+                    <p class="trend-empty">No bills in the last 6 months yet. Your monthly totals will appear here.</p>
+                <?php else: ?>
+                    <div class="trend-chart">
+                        <svg viewBox="0 0 <?= $tW ?> 206" role="img"
+                             aria-label="Bill totals for the last 6 months, split into paid and still owed. A table with the same numbers follows.">
+                            <?php for ($k = 0; $k <= $tTicks; $k++): ?>
+                                <?php $gy = $tBottom - $k * $tStep / $tAxisMax * $tPlotH; ?>
+                                <line x1="<?= $tLeft ?>" x2="<?= $tRight ?>" y1="<?= round($gy, 2) ?>" y2="<?= round($gy, 2) ?>"
+                                      class="<?= $k === 0 ? 'trend-baseline' : 'trend-grid' ?>"/>
+                                <text x="<?= $tLeft - 8 ?>" y="<?= round($gy + 4, 2) ?>" text-anchor="end" class="trend-axis"><?= chartCompactAmount($k * $tStep) ?></text>
+                            <?php endfor; ?>
+                            <?php foreach ($trend as $i => $mo): ?>
+                                <?php
+                                $cx = $tLeft + $tSlot * $i + $tSlot / 2;
+                                $x = $cx - $tBarW / 2;
+                                $paidH = $mo['paid'] / $tAxisMax * $tPlotH;
+                                $owedH = $mo['owed'] / $tAxisMax * $tPlotH;
+                                $gap = $paidH > 0 && $owedH > 0 ? 2 : 0; // surface gap between the two segments
+                                $isNow = $i === 5;
+                                ?>
+                                <a href="reports.php?month=<?= $mo['key'] ?>" class="trend-col">
+                                    <title><?= $mo['label'] ?>: ₱<?= number_format($mo['total'], 2) ?> due · paid ₱<?= number_format($mo['paid'], 2) ?> · still owed ₱<?= number_format($mo['owed'], 2) ?> · <?= $mo['count'] ?> bill<?= $mo['count'] === 1 ? '' : 's' ?></title>
+                                    <rect x="<?= round($tLeft + $tSlot * $i + 4, 2) ?>" y="<?= $tTop - 18 ?>" width="<?= round($tSlot - 8, 2) ?>"
+                                          height="<?= $tBottom - $tTop + 18 ?>" rx="8" class="trend-hit"/>
+                                    <?php if ($paidH > 0): ?>
+                                        <?php if ($owedH > 0): ?>
+                                            <rect x="<?= round($x, 2) ?>" y="<?= round($tBottom - $paidH, 2) ?>" width="<?= $tBarW ?>" height="<?= round($paidH, 2) ?>" class="trend-paid"/>
+                                        <?php else: ?>
+                                            <path d="<?= chartTopRoundedBar($x, $tBottom - $paidH, $tBarW, $paidH) ?>" class="trend-paid"/>
+                                        <?php endif; ?>
+                                    <?php endif; ?>
+                                    <?php if ($owedH > 0): ?>
+                                        <path d="<?= chartTopRoundedBar($x, $tBottom - $paidH - $gap - $owedH, $tBarW, $owedH) ?>" class="trend-owed"/>
+                                    <?php endif; ?>
+                                    <?php if ($mo['total'] > 0): ?>
+                                        <text x="<?= round($cx, 2) ?>" y="<?= round($tBottom - $paidH - $gap - $owedH - 6, 2) ?>" text-anchor="middle" class="trend-value"><?= chartCompactAmount($mo['total']) ?></text>
+                                    <?php endif; ?>
+                                    <text x="<?= round($cx, 2) ?>" y="<?= $tBottom + 20 ?>" text-anchor="middle" class="trend-month<?= $isNow ? ' now' : '' ?>"><?= $mo['short'] ?></text>
+                                </a>
+                            <?php endforeach; ?>
+                        </svg>
+                        <div class="trend-legend" aria-hidden="true">
+                            <span><i class="trend-key paid"></i>Paid</span>
+                            <span><i class="trend-key owed"></i>Still owed</span>
+                        </div>
+                        <details class="trend-table">
+                            <summary>Show as table</summary>
+                            <table>
+                                <thead><tr><th>Month</th><th>Bills</th><th>Paid</th><th>Still owed</th><th>Total due</th></tr></thead>
+                                <tbody>
+                                    <?php foreach ($trend as $mo): ?>
+                                        <tr>
+                                            <td><?= $mo['label'] ?></td>
+                                            <td><?= $mo['count'] ?></td>
+                                            <td>₱<?= number_format($mo['paid'], 2) ?></td>
+                                            <td>₱<?= number_format($mo['owed'], 2) ?></td>
+                                            <td>₱<?= number_format($mo['total'], 2) ?></td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </details>
+                    </div>
+                <?php endif; ?>
             </div>
 
             <!-- Content Grid -->

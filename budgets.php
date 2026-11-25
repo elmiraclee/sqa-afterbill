@@ -12,6 +12,7 @@ require_once __DIR__ . '/includes/csrf.php';
 require_once __DIR__ . '/includes/recurring_bills.php';
 require_once __DIR__ . '/includes/budgets.php';
 require_once __DIR__ . '/includes/activity.php';
+require_once __DIR__ . '/includes/categories.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -31,7 +32,7 @@ $monthStart = new DateTime($monthParam . '-01');
 $prevMonth = (clone $monthStart)->modify('-1 month')->format('Y-m');
 $nextMonth = (clone $monthStart)->modify('+1 month')->format('Y-m');
 
-$categories = $pdo->query('SELECT category_id, category_name FROM categories ORDER BY category_name')->fetchAll();
+$categories = userCategories($pdo, $userId); // built-ins + this user's own
 $categoryNames = array_column($categories, 'category_name', 'category_id');
 
 $errors = [];

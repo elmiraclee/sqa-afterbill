@@ -6,7 +6,9 @@
  * Accepts either:
  *   bill_id     removes every payment recorded for that bill (from bills.php)
  *   payment_id  removes that one payment (from payments.php)
- * In both cases the bill goes back to 'unpaid' once it has no payments left.
+ * Afterwards the bill's status is worked out again from the payments that are left
+ * (includes/payments.php): paid only while they still cover the amount. Receipt files of the
+ * removed payments are deleted.
  */
 
 require_once __DIR__ . '/includes/auth.php';
@@ -15,6 +17,7 @@ require_login(); // session check, idle timeout, sign-out after a password chang
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/csrf.php';
 require_once __DIR__ . '/includes/activity.php';
+require_once __DIR__ . '/includes/payments.php';
 
 $returnTo = ($_POST['return'] ?? '') === 'payments' ? 'payments.php' : 'bills.php';
 
@@ -56,21 +59,31 @@ try {
     $pdo->beginTransaction();
 
     if (ctype_digit((string)$paymentId)) {
-        $del = $pdo->prepare('DELETE FROM payments WHERE payment_id = ? AND bill_id = ?');
-        $del->execute([(int)$paymentId, $ownedBillId]);
+        $where = 'payment_id = ? AND bill_id = ?';
+        $whereParams = [(int)$paymentId, $ownedBillId];
     } else {
-        $del = $pdo->prepare('DELETE FROM payments WHERE bill_id = ?');
-        $del->execute([$ownedBillId]);
+        $where = 'bill_id = ?';
+        $whereParams = [$ownedBillId];
     }
 
-    $remaining = $pdo->prepare('SELECT COUNT(*) FROM payments WHERE bill_id = ?');
-    $remaining->execute([$ownedBillId]);
-    if ((int)$remaining->fetchColumn() === 0) {
-        $upd = $pdo->prepare('UPDATE bills SET status = \'unpaid\' WHERE bill_id = ? AND user_id = ?');
-        $upd->execute([$ownedBillId, $userId]);
+    try {
+        $files = $pdo->prepare("SELECT receipt_file FROM payments WHERE $where AND receipt_file IS NOT NULL");
+        $files->execute($whereParams);
+        $receiptFiles = $files->fetchAll(PDO::FETCH_COLUMN);
+    } catch (PDOException $e) {
+        $receiptFiles = []; // migration 004 not run: there are no receipts
     }
+
+    $pdo->prepare("DELETE FROM payments WHERE $where")->execute($whereParams);
+
+    refreshBillStatus($pdo, $ownedBillId);
 
     $pdo->commit();
+
+    // Files go only once the rows are gone for good.
+    foreach ($receiptFiles as $file) {
+        deleteReceiptFile($file);
+    }
 
     $nameStmt = $pdo->prepare('SELECT bill_name FROM bills WHERE bill_id = ?');
     $nameStmt->execute([$ownedBillId]);
@@ -79,7 +92,9 @@ try {
     header('Location: ' . $returnTo . '?unpaid=1');
     exit;
 } catch (PDOException $e) {
-    $pdo->rollBack();
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
     header('Location: ' . $returnTo . '?error=1');
     exit;
 }

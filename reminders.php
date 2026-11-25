@@ -9,6 +9,7 @@ require_login(); // session check, idle timeout, sign-out after a password chang
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/recurring_bills.php';
+require_once __DIR__ . '/includes/reminders.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -27,7 +28,8 @@ $windowDays = $_SESSION['reminder_days'] ?? 7;
 
 // Every unpaid bill that is overdue or due within the window, in one query.
 $stmt = $pdo->prepare(
-    "SELECT b.bill_id, b.bill_name, b.amount, b.due_date, b.is_recurring, c.category_name,
+    "SELECT b.bill_id, b.bill_name, b.amount, b.due_date, b.is_recurring, c.category_name, "
+    . (recurrenceColumnsExist($pdo) ? 'b.repeat_interval,' : "'monthly' AS repeat_interval,") . "
             DATEDIFF(b.due_date, CURDATE()) AS days_left
      FROM bills b
      JOIN categories c ON c.category_id = b.category_id
@@ -126,6 +128,19 @@ if ($groups['upcoming']['rows']) {
 
         <main class="page-body">
 
+            <?php $emailReminders = reminderSettings($pdo, $userId); ?>
+            <?php if ($emailReminders !== null): ?>
+                <div class="alert <?= $emailReminders['enabled'] ? 'alert-success' : 'alert-warning' ?>">
+                    <?php if ($emailReminders['enabled']): ?>
+                        Email reminders are on: you get a daily email when bills are overdue or due within
+                        <?= $emailReminders['days'] ?> day<?= $emailReminders['days'] === 1 ? '' : 's' ?>.
+                    <?php else: ?>
+                        Email reminders are off, so you only see due bills here.
+                    <?php endif; ?>
+                    <a href="account.php#reminders">Change</a>
+                </div>
+            <?php endif; ?>
+
             <div class="toolbar">
                 <div>
                     <span class="toolbar-label">Remind me about bills due within</span>
@@ -189,7 +204,7 @@ if ($groups['upcoming']['rows']) {
                                 <?php foreach ($groups[$key]['rows'] as $bill): ?>
                                     <?php $daysLeft = (int)$bill['days_left']; ?>
                                     <tr>
-                                        <td class="strong"><?= htmlspecialchars($bill['bill_name']) ?><?= $bill['is_recurring'] ? ' <span class="muted">· monthly</span>' : '' ?></td>
+                                        <td class="strong"><?= htmlspecialchars($bill['bill_name']) ?><?= $bill['is_recurring'] ? ' <span class="muted">· ' . strtolower(REPEAT_INTERVALS[$bill['repeat_interval']] ?? 'monthly') . '</span>' : '' ?></td>
                                         <td><?= htmlspecialchars($bill['category_name']) ?></td>
                                         <td>₱<?= number_format((float)$bill['amount'], 2) ?></td>
                                         <td><?= (new DateTime($bill['due_date']))->format('M j, Y') ?></td>

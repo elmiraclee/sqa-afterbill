@@ -8,6 +8,8 @@ require_login(); // session check, idle timeout, sign-out after a password chang
 
 require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/recurring_bills.php';
+require_once __DIR__ . '/includes/payments.php';
+require_once __DIR__ . '/includes/charts.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -27,35 +29,16 @@ $monthEnd = (clone $monthStart)->modify('last day of this month');
 $prevMonth = (clone $monthStart)->modify('-1 month')->format('Y-m');
 $nextMonth = (clone $monthStart)->modify('+1 month')->format('Y-m');
 
-// 1) Selected month, grouped by status: count + sum for paid and unpaid in one query.
-$statusStmt = $pdo->prepare(
-    'SELECT status, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
-     FROM bills
-     WHERE user_id = ?
-       AND due_date BETWEEN ? AND ?
-     GROUP BY status'
-);
-$statusStmt->execute([
-    $_SESSION['user_id'],
-    $monthStart->format('Y-m-d'),
-    $monthEnd->format('Y-m-d'),
-]);
-
-$paidCount = 0;
-$paidSum = 0.0;
-$unpaidCount = 0;
-$unpaidSum = 0.0;
-foreach ($statusStmt->fetchAll() as $row) {
-    if ($row['status'] === 'paid') {
-        $paidCount = (int)$row['cnt'];
-        $paidSum = (float)$row['total'];
-    } elseif ($row['status'] === 'unpaid') {
-        $unpaidCount = (int)$row['cnt'];
-        $unpaidSum = (float)$row['total'];
-    }
-}
-$totalCount = $paidCount + $unpaidCount;
-$totalExpenses = $paidSum + $unpaidSum;
+// 1) Selected month, counting money actually paid (partially paid bills split into the part paid
+// and the part still owed) — the same rule as the dashboard (includes/payments.php).
+$month = billTotals($pdo, (int)$_SESSION['user_id'], $monthStart->format('Y-m-d'), $monthEnd->format('Y-m-d'));
+$paidCount = $month['paid_count'];
+$partialCount = $month['partial_count'];
+$unpaidCount = $month['unpaid_count'] + $month['partial_count'];
+$paidSum = $month['paid'];
+$unpaidSum = $month['unpaid'];
+$totalCount = $month['count'];
+$totalExpenses = $month['total'];
 
 // 2) Selected month, grouped by category (paid + unpaid combined), largest first. Only
 // categories that actually have bills that month are returned; the UI treats the rest as zero.
@@ -107,26 +90,9 @@ foreach ($categoryTotals as $catRow) {
 $historyStart = (new DateTime(date('Y-m-01')))->modify('-5 months');
 $historyEnd = new DateTime(date('Y-m-t'));
 
-$historyStmt = $pdo->prepare(
-    "SELECT DATE_FORMAT(due_date, '%Y-%m') AS ym, status, COUNT(*) AS cnt, SUM(amount) AS total
-     FROM bills
-     WHERE user_id = ?
-       AND due_date BETWEEN ? AND ?
-     GROUP BY ym, status"
-);
-$historyStmt->execute([
-    $_SESSION['user_id'],
-    $historyStart->format('Y-m-d'),
-    $historyEnd->format('Y-m-d'),
-]);
 $historyByMonth = [];
-foreach ($historyStmt->fetchAll() as $row) {
-    $ym = $row['ym'];
-    $historyByMonth[$ym] ??= ['cnt' => 0, 'paid' => 0.0, 'unpaid' => 0.0];
-    $historyByMonth[$ym]['cnt'] += (int)$row['cnt'];
-    if ($row['status'] === 'paid' || $row['status'] === 'unpaid') {
-        $historyByMonth[$ym][$row['status']] += (float)$row['total'];
-    }
+foreach (billTotals($pdo, (int)$_SESSION['user_id'], $historyStart->format('Y-m-d'), $historyEnd->format('Y-m-d'), true) as $ym => $t) {
+    $historyByMonth[$ym] = ['cnt' => $t['count'], 'paid' => $t['paid'], 'unpaid' => $t['unpaid']];
 }
 
 $spendingHistory = [];
@@ -149,28 +115,6 @@ for ($i = 0; $i < 6; $i++) {
 
 // Column chart geometry (SVG user units; the SVG scales to its container). The y-axis is
 // rounded up to a "nice" step (1, 2, 2.5, 5 x 10^n) with at most 4 gridlines.
-function chartCompactAmount(float $n): string
-{
-    if ($n >= 1000000) {
-        return '₱' . rtrim(rtrim(number_format($n / 1000000, 1), '0'), '.') . 'M';
-    }
-    if ($n >= 1000) {
-        return '₱' . rtrim(rtrim(number_format($n / 1000, 1), '0'), '.') . 'k';
-    }
-    return '₱' . number_format($n, 0);
-}
-
-function chartNiceStep(float $rough): float
-{
-    $pow = 10 ** floor(log10($rough));
-    foreach ([1, 2, 2.5, 5, 10] as $mult) {
-        if ($mult * $pow >= $rough) {
-            return $mult * $pow;
-        }
-    }
-    return 10 * $pow;
-}
-
 $chartW = 640;
 $plotLeft = 56;
 $plotRight = 624;
@@ -324,6 +268,12 @@ $topCategory = $donutSegments[0] ?? null;
 
         .topbar-left h2 { font-size: 1.1rem; font-weight: 700; color: var(--deep-navy); }
         .topbar-left p { font-size: 0.8rem; color: var(--text-muted); }
+
+        .btn-pdf {
+            padding: 8px 14px; border: 1.5px solid var(--electric-blue); border-radius: 8px; font-size: 0.82rem;
+            font-weight: 600; color: var(--electric-blue); text-decoration: none; white-space: nowrap;
+        }
+        .btn-pdf:hover { background: var(--electric-blue); color: #fff; }
 
         .btn-logout {
             display: flex; align-items: center; gap: 6px;
@@ -545,7 +495,9 @@ $topCategory = $donutSegments[0] ?? null;
                 <h2>Reports</h2>
                 <p>Your monthly spending summary.</p>
             </div>
-            <div class="topbar-right">
+            <div class="topbar-right" style="display:flex;align-items:center;gap:10px;">
+                <a href="report_pdf.php?month=<?= htmlspecialchars($monthParam) ?>" class="btn-pdf"
+                   title="Download the <?= htmlspecialchars($monthStart->format('F Y')) ?> report as a PDF">Download PDF</a>
                 <?php require __DIR__ . '/partials/logout-button.php'; ?>
             </div>
         </header>
@@ -594,7 +546,7 @@ $topCategory = $donutSegments[0] ?? null;
                     </div>
                     <div>
                         <div class="stat-value">₱<?= number_format($paidSum, 2) ?></div>
-                        <div class="stat-label">Paid · <?= $paidCount ?> bill<?= $paidCount === 1 ? '' : 's' ?></div>
+                        <div class="stat-label">Paid · <?= $paidCount ?> bill<?= $paidCount === 1 ? '' : 's' ?> fully paid</div>
                     </div>
                 </div>
 
@@ -606,7 +558,7 @@ $topCategory = $donutSegments[0] ?? null;
                     </div>
                     <div>
                         <div class="stat-value">₱<?= number_format($unpaidSum, 2) ?></div>
-                        <div class="stat-label">Unpaid · <?= $unpaidCount ?> bill<?= $unpaidCount === 1 ? '' : 's' ?></div>
+                        <div class="stat-label">Still owed · <?= $unpaidCount ?> bill<?= $unpaidCount === 1 ? '' : 's' ?><?= $partialCount > 0 ? ' (' . $partialCount . ' partly paid)' : '' ?></div>
                     </div>
                 </div>
             </div>

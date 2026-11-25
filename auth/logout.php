@@ -18,6 +18,8 @@ if (isset($_SESSION['user_id'])) {
     require_once __DIR__ . '/../config/database.php';
     require_once __DIR__ . '/../includes/activity.php';
     logActivity(getPDO(), (int)$_SESSION['user_id'], 'logout');
+    require_once __DIR__ . '/../includes/sessions.php';
+    sessionTrackEnd(getPDO());
 }
 
 session_unset();

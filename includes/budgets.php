@@ -19,20 +19,31 @@ function budgetUsage(PDO $pdo, int $userId, DateTime $monthStart): array
 {
     $monthEnd = (clone $monthStart)->modify('last day of this month');
 
-    $stmt = $pdo->prepare(
-        'SELECT c.category_id, c.category_name, bu.monthly_limit,
-                COALESCE(s.spent, 0) AS spent, COALESCE(s.cnt, 0) AS cnt
-         FROM categories c
-         LEFT JOIN budgets bu ON bu.category_id = c.category_id AND bu.user_id = ?
-         LEFT JOIN (
-             SELECT category_id, SUM(amount) AS spent, COUNT(*) AS cnt
-             FROM bills
-             WHERE user_id = ? AND due_date BETWEEN ? AND ?
-             GROUP BY category_id
-         ) s ON s.category_id = c.category_id
-         ORDER BY c.category_name'
-    );
-    $stmt->execute([$userId, $userId, $monthStart->format('Y-m-d'), $monthEnd->format('Y-m-d')]);
+    $sql = 'SELECT c.category_id, c.category_name, bu.monthly_limit,
+                   COALESCE(s.spent, 0) AS spent, COALESCE(s.cnt, 0) AS cnt
+            FROM categories c
+            LEFT JOIN budgets bu ON bu.category_id = c.category_id AND bu.user_id = ?
+            LEFT JOIN (
+                SELECT category_id, SUM(amount) AS spent, COUNT(*) AS cnt
+                FROM bills
+                WHERE user_id = ? AND due_date BETWEEN ? AND ?
+                GROUP BY category_id
+            ) s ON s.category_id = c.category_id
+            %s
+            ORDER BY c.category_name';
+    $params = [$userId, $userId, $monthStart->format('Y-m-d'), $monthEnd->format('Y-m-d')];
+
+    try {
+        // Built-in categories plus this user's own custom ones (migration 004), never anyone else's.
+        $stmt = $pdo->prepare(sprintf($sql, 'WHERE c.user_id IS NULL OR c.user_id = ?'));
+        $stmt->execute([...$params, $userId]);
+    } catch (PDOException $e) {
+        if (($e->errorInfo[1] ?? null) !== 1054) { // 1054 = unknown column: migration 004 not run
+            throw $e;
+        }
+        $stmt = $pdo->prepare(sprintf($sql, ''));
+        $stmt->execute($params);
+    }
 
     $usage = [];
     foreach ($stmt->fetchAll() as $row) {

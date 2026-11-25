@@ -10,9 +10,12 @@
  *     stale and that session is ended on its next request. The session that made the change
  *     gets the new fingerprint (auth_login_session) and stays signed in.
  *   - A session whose user was deleted is ended.
+ *   - A session signed out from another device (Account → Signed-in devices) is ended
+ *     (includes/sessions.php).
  */
 
 require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/sessions.php';
 
 const SESSION_IDLE_MINUTES = 30;
 
@@ -35,15 +38,28 @@ function session_idle_expired(int $lastActivity, int $now): bool
  */
 function auth_login_session(int $userId, string $fullName, string $passwordHash): void
 {
+    $previous = session_status() === PHP_SESSION_ACTIVE ? sessionHash() : null;
     session_regenerate_id(true);
+    unset($_SESSION['two_factor_pending']);
     $_SESSION['user_id']       = $userId;
     $_SESSION['user_name']     = $fullName;
     $_SESSION['auth_fp']       = auth_fingerprint($passwordHash);
     $_SESSION['last_activity'] = time();
+
+    $pdo = getPDO();
+    if ($previous !== null) {
+        // The old session id is gone; so is its device row (e.g. after a password change).
+        try {
+            $pdo->prepare('DELETE FROM user_sessions WHERE session_hash = ?')->execute([$previous]);
+        } catch (PDOException $e) {
+        }
+    }
+    sessionTrackStart($pdo, $userId, $_SESSION['auth_fp']);
 }
 
 function auth_end_session(string $reason): void
 {
+    sessionTrackEnd(getPDO());
     $_SESSION = [];
     session_destroy();
     session_start(); // fresh, empty session so the page can still render forms with a CSRF token
@@ -81,6 +97,11 @@ function auth_check(): bool
         return false;
     }
 
+    if (!sessionTrackCheck(getPDO(), (int)$_SESSION['user_id'], (string)$_SESSION['auth_fp'])) {
+        auth_end_session('revoked');
+        return false;
+    }
+
     $_SESSION['last_activity'] = time();
     return true;
 }
@@ -104,6 +125,9 @@ function auth_end_message(?string $reason): string
         'signed_out' => 'You were signed out because your password was changed. Please log in again.',
         'deleted'    => 'Your account and all of its data have been permanently deleted.',
         'reset'      => 'Your password has been reset. Log in with your new password.',
+        'revoked'    => 'You were signed out from another device. Please log in again.',
+        'two_factor_expired' => 'Your login timed out before the code was entered. Please log in again.',
+        'two_factor_failed'  => 'Too many wrong codes. Please log in again.',
         default      => '',
     };
 }

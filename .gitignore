@@ -16,3 +16,13 @@ config/database.local.php
 
 # Ready-to-upload server config files (contain real passwords)
 deploy/
+
+# Cypress
+node_modules/
+cypress/videos/
+cypress/screenshots/
+cypress/downloads/
+
+
+# macOS
+.DS_Store

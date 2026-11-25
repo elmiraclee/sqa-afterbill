@@ -21,6 +21,10 @@ require_once __DIR__ . '/../includes/password_policy.php';
 require_once __DIR__ . '/../includes/auth.php';
 require_once __DIR__ . '/../includes/rate_limit.php';
 require_once __DIR__ . '/../config/mail.php';
+require_once __DIR__ . '/../includes/payments.php';
+require_once __DIR__ . '/../includes/reminders.php';
+require_once __DIR__ . '/../includes/categories.php';
+require_once __DIR__ . '/../includes/two_factor.php';
 
 $BASE = rtrim($argv[1] ?? 'http://localhost/sqa_afterbill', '/');
 $pdo = getPDO();
@@ -67,7 +71,9 @@ final class Client
         }
         if ($method === 'POST') {
             curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
+            // A CURLFile anywhere in the data = a file upload, sent as multipart/form-data.
+            $hasFile = (bool)array_filter($data, fn($v) => $v instanceof CURLFile);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $hasFile ? $data : http_build_query($data));
         }
         $raw = curl_exec($ch);
         if ($raw === false) {
@@ -437,14 +443,15 @@ try {
 
     check('A14', 'Every protected page redirects anonymous users to login', function () use ($anon) {
         $pages = ['dashboard.php', 'bills.php', 'add_bill.php', 'edit_bill.php?bill_id=1', 'mark_paid.php?bill_id=1',
-                  'calendar.php', 'reports.php', 'payments.php', 'reminders.php', 'account.php'];
+                  'calendar.php', 'reports.php', 'payments.php', 'reminders.php', 'account.php',
+                  'categories.php', 'receipt.php?payment_id=1', 'report_pdf.php'];
         foreach ($pages as $p) {
             $r = $anon->get($p);
             if ($r['status'] !== 302 || !str_contains($r['location'], 'login.php')) {
                 return "$p returned {$r['status']} -> {$r['location']}";
             }
         }
-        foreach (['delete_bill.php', 'undo_payment.php'] as $p) {
+        foreach (['delete_bill.php', 'undo_payment.php', 'attach_receipt.php', 'bulk_pay.php'] as $p) {
             $r = $anon->postRaw($p, ['bill_id' => 1]);
             if ($r['status'] !== 302 || !str_contains($r['location'], 'login.php')) {
                 return "POST $p returned {$r['status']} -> {$r['location']}";
@@ -865,7 +872,7 @@ try {
     group('PAGES — Health');
     // =========================================================================================
     check('H01', 'All app pages load (200) without PHP errors', function () use ($a) {
-        foreach (['dashboard.php', 'bills.php', 'add_bill.php', 'calendar.php', 'reports.php', 'payments.php', 'reminders.php', 'account.php', 'budgets.php', 'activity.php', 'index.php'] as $p) {
+        foreach (['dashboard.php', 'bills.php', 'add_bill.php', 'calendar.php', 'reports.php', 'payments.php', 'reminders.php', 'account.php', 'budgets.php', 'activity.php', 'categories.php', 'index.php'] as $p) {
             $r = $a->get($p);
             if ($r['status'] !== 200 || ($e = phpErrorsIn($r['body']))) {
                 return "$p -> {$r['status']} " . ($e ?? '');
@@ -1048,7 +1055,9 @@ try {
 
     check('U14', "Budgets are per user: A cannot see or remove B's budget", function () use ($a, $budgetRow, $userA, $userB) {
         $body = $a->get('budgets.php')['body'];
-        if (str_contains($body, '800.50')) {
+        // 800.50 as a whole number (shown as ₱800.50 or in the input's value), not as part of
+        // one of A's own totals such as ₱2,800.50.
+        if (preg_match('/(?<![\d,])800\.50/', $body)) {
             return "B's budget visible on A's page";
         }
         $a->post('budgets.php', ['action' => 'remove', 'category_id' => 1]);
@@ -1813,12 +1822,975 @@ try {
     });
 
     // =========================================================================================
+    group('NEW FEATURE — Custom categories');
+    // =========================================================================================
+    $catIdByName = function (string $name, int $userId) use ($pdo): ?int {
+        $s = $pdo->prepare('SELECT category_id FROM categories WHERE category_name = ? AND user_id = ?');
+        $s->execute([$name, $userId]);
+        $id = $s->fetchColumn();
+        return $id === false ? null : (int)$id;
+    };
+    $carCat = null;
+
+    check('C01', 'Categories page lists the built-ins; adding a category stores it for that user only',
+        function () use ($a, $userA, $catIdByName, &$carCat) {
+            $page = $a->get('categories.php')['body'];
+            if (!str_contains($page, 'Utilities') || !str_contains($page, 'Built-in')) {
+                return 'built-in categories not listed';
+            }
+            $r = $a->post('categories.php', ['action' => 'add', 'category_name' => 'Audit Car']);
+            $carCat = $catIdByName('Audit Car', $userA);
+            return expect($r['status'] === 302 && $carCat !== null, "category not created ({$r['status']})");
+        });
+
+    check('C02', 'Duplicate names are rejected: own name in another case, and built-in names', function () use ($a, $pdo, $userA) {
+        foreach (['audit car', 'UTILITIES', '  Others  '] as $name) {
+            $r = $a->post('categories.php', ['action' => 'add', 'category_name' => $name]);
+            if ($r['status'] === 302) {
+                return "\"$name\" was accepted";
+            }
+        }
+        $n = $pdo->prepare('SELECT COUNT(*) FROM categories WHERE user_id = ?');
+        $n->execute([$userA]);
+        return expect((int)$n->fetchColumn() === 1, 'duplicate category rows were stored');
+    });
+
+    check('C03', 'Invalid names are rejected: too short, too long, control characters, empty', function () use ($a) {
+        foreach (['X', str_repeat('a', 51), "Bad\x07Name", '   '] as $name) {
+            $r = $a->post('categories.php', ['action' => 'add', 'category_name' => $name]);
+            if ($r['status'] === 302) {
+                return 'accepted: ' . json_encode($name);
+            }
+        }
+        return true;
+    });
+
+    check('C04', 'A custom category can be used for a bill and as a bills filter', function () use ($a, $pdo, $userA, $validBill, &$carCat) {
+        $a->post('add_bill.php', $validBill(['bill_name' => 'Audit Car Loan', 'category_id' => (string)$carCat]));
+        $bill = latestBill($pdo, $userA);
+        if ($bill['bill_name'] !== 'Audit Car Loan' || (int)$bill['category_id'] !== $carCat) {
+            return 'bill not saved in the custom category';
+        }
+        $list = $a->get("bills.php?category_id=$carCat")['body'];
+        return expect(str_contains($list, 'Audit Car Loan') && !str_contains($list, 'Audit Electric'), 'filter by custom category failed');
+    });
+
+    check('C05', "Another user can't see or use someone's custom category", function () use ($b, $pdo, $userB, $validBill, &$carCat) {
+        foreach (['add_bill.php', 'bills.php', 'budgets.php', 'categories.php'] as $page) {
+            if (str_contains($b->get($page)['body'], 'Audit Car')) {
+                return "user B sees A's category on $page";
+            }
+        }
+        $b->post('add_bill.php', $validBill(['bill_name' => 'Sneaky Bill', 'category_id' => (string)$carCat]));
+        $last = latestBill($pdo, $userB);
+        if ($last && $last['bill_name'] === 'Sneaky Bill') {
+            return "user B created a bill in A's category";
+        }
+        $r = $b->post('budgets.php', ['action' => 'save', 'category_id' => (string)$carCat, 'monthly_limit' => '100']);
+        $n = $pdo->prepare('SELECT COUNT(*) FROM budgets WHERE user_id = ? AND category_id = ?');
+        $n->execute([$userB, $carCat]);
+        return expect((int)$n->fetchColumn() === 0, "user B set a budget on A's category");
+    });
+
+    check('C06', "Built-in categories and other users' categories can't be renamed or deleted", function () use ($a, $b, $pdo, &$carCat) {
+        $b->post('categories.php', ['action' => 'rename', 'category_id' => (string)$carCat, 'category_name' => 'Hacked']);
+        $b->post('categories.php', ['action' => 'delete', 'category_id' => (string)$carCat]);
+        $a->post('categories.php', ['action' => 'rename', 'category_id' => '1', 'category_name' => 'Hacked']);
+        $a->post('categories.php', ['action' => 'delete', 'category_id' => '1']);
+        $names = $pdo->query("SELECT category_id, category_name FROM categories WHERE category_id IN (1, $carCat)")->fetchAll(PDO::FETCH_KEY_PAIR);
+        return expect(($names[1] ?? '') === 'Utilities' && ($names[$carCat] ?? '') === 'Audit Car', 'category changed: ' . json_encode($names));
+    });
+
+    check('C07', 'Rename works, keeps the bills, and is logged', function () use ($a, $pdo, $userA, &$carCat) {
+        $r = $a->post('categories.php', ['action' => 'rename', 'category_id' => (string)$carCat, 'category_name' => 'Audit Vehicle']);
+        $name = $pdo->query("SELECT category_name FROM categories WHERE category_id = $carCat")->fetchColumn();
+        $log = $pdo->prepare("SELECT details FROM activity_log WHERE user_id = ? AND action = 'category_renamed' ORDER BY log_id DESC LIMIT 1");
+        $log->execute([$userA]);
+        return expect($r['status'] === 302 && $name === 'Audit Vehicle' && str_contains((string)$log->fetchColumn(), 'Audit Vehicle'),
+            'rename not saved or not logged');
+    });
+
+    check('C08', 'Names are HTML-escaped on every page', function () use ($a, $pdo, $userA) {
+        $a->post('categories.php', ['action' => 'add', 'category_name' => '<b>x</b><script>1</script>']);
+        foreach (['categories.php', 'add_bill.php', 'budgets.php', 'bills.php'] as $page) {
+            if (str_contains($a->get($page)['body'], '<script>1</script>')) {
+                return "unescaped category name on $page";
+            }
+        }
+        $pdo->prepare("DELETE FROM categories WHERE user_id = ? AND category_name LIKE '<b>%'")->execute([$userA]);
+        return true;
+    });
+
+    check('C09', 'Deleting a category moves its bills to Others and removes its budget', function () use ($a, $pdo, $userA, &$carCat) {
+        $a->post('budgets.php', ['action' => 'save', 'category_id' => (string)$carCat, 'monthly_limit' => '5000']);
+        $budget = $pdo->prepare('SELECT COUNT(*) FROM budgets WHERE user_id = ? AND category_id = ?');
+        $budget->execute([$userA, $carCat]);
+        if ((int)$budget->fetchColumn() !== 1) {
+            return 'could not set a budget on the custom category';
+        }
+        $r = $a->post('categories.php', ['action' => 'delete', 'category_id' => (string)$carCat]);
+        $others = fallbackCategoryId($pdo);
+        $bill = $pdo->prepare("SELECT category_id FROM bills WHERE user_id = ? AND bill_name = 'Audit Car Loan'");
+        $bill->execute([$userA]);
+        $budget->execute([$userA, $carCat]);
+        $gone = $pdo->query("SELECT COUNT(*) FROM categories WHERE category_id = $carCat")->fetchColumn();
+        return expect($r['status'] === 302 && (int)$bill->fetchColumn() === $others && (int)$budget->fetchColumn() === 0 && (int)$gone === 0,
+            'bill not moved, budget not removed, or category not deleted');
+    });
+
+    check('C10', 'Adding without a CSRF token is rejected', function () use ($a, $pdo, $userA) {
+        $a->postRaw('categories.php', ['action' => 'add', 'category_name' => 'Forged Cat']);
+        $n = $pdo->prepare("SELECT COUNT(*) FROM categories WHERE user_id = ? AND category_name = 'Forged Cat'");
+        $n->execute([$userA]);
+        return expect((int)$n->fetchColumn() === 0, 'forged request created a category');
+    });
+
+    check('C11', 'At most ' . CATEGORY_CUSTOM_LIMIT . ' custom categories per user', function () use ($b, $pdo, $userB) {
+        $ins = $pdo->prepare('INSERT INTO categories (user_id, category_name) VALUES (?, ?)');
+        for ($i = 1; $i <= CATEGORY_CUSTOM_LIMIT; $i++) {
+            $ins->execute([$userB, "Limit Cat $i"]);
+        }
+        $r = $b->post('categories.php', ['action' => 'add', 'category_name' => 'One Too Many']);
+        $n = $pdo->prepare('SELECT COUNT(*) FROM categories WHERE user_id = ?');
+        $n->execute([$userB]);
+        $count = (int)$n->fetchColumn();
+        $pdo->prepare("DELETE FROM categories WHERE user_id = ? AND category_name LIKE 'Limit Cat %'")->execute([$userB]);
+        return expect($r['status'] !== 302 && $count === CATEGORY_CUSTOM_LIMIT, "limit not enforced ($count categories)");
+    });
+
+    // =========================================================================================
+    group('NEW FEATURE — Partial payments');
+    // =========================================================================================
+    $pay = fn(Client $c, int $billId, string $amount, array $extra = []) => $c->post('mark_paid.php', array_merge([
+        'bill_id' => $billId, 'payment_date' => date('Y-m-d'), 'amount_paid' => $amount, 'payment_method' => 'cash',
+    ], $extra), "mark_paid.php?bill_id=$billId");
+    $partBill = insertBill($pdo, $userA, 'Audit Tuition', date('Y-m-d', strtotime('+6 days')), false, 'unpaid', 1000.00, 4);
+
+    check('PP01', 'Paying less than the amount records the payment but leaves the bill unpaid', function () use ($a, $pdo, $pay, $partBill) {
+        $r = $pay($a, $partBill, '400');
+        return expect(str_contains($r['location'], 'partial=1') && paymentCount($pdo, $partBill) === 1
+            && billById($pdo, $partBill)['status'] === 'unpaid', 'partial payment not handled: ' . $r['location']);
+    });
+
+    check('PP02', 'My Bills shows "Partially paid" with the paid / left amounts and an Add Payment button', function () use ($a) {
+        $body = $a->get('bills.php?status=partial')['body'];
+        return expect(str_contains($body, 'Audit Tuition') && str_contains($body, 'Partially paid')
+            && str_contains($body, '₱400.00 paid · ₱600.00 left') && str_contains($body, 'Add Payment'),
+            'partial status / balance not shown, or partial filter broken');
+    });
+
+    check('PP03', 'Payment form defaults to the remaining balance', function () use ($a, $partBill) {
+        $body = $a->get("mark_paid.php?bill_id=$partBill")['body'];
+        return expect(str_contains($body, 'value="600.00"') && str_contains($body, '₱600.00 left to pay'), 'balance not prefilled');
+    });
+
+    check('PP04', 'Paying more than the balance, or less than 1 centavo, is rejected', function () use ($a, $pdo, $pay, $partBill) {
+        foreach (['600.01', '0.004', '-5'] as $amount) {
+            if ($pay($a, $partBill, $amount)['status'] === 302) {
+                return "amount $amount accepted";
+            }
+        }
+        return expect(paymentCount($pdo, $partBill) === 1, 'an invalid payment was stored');
+    });
+
+    check('PP05', 'A second payment covering the rest marks the bill paid', function () use ($a, $pdo, $pay, $partBill) {
+        $r = $pay($a, $partBill, '600');
+        return expect(str_contains($r['location'], 'paid=1') && billById($pdo, $partBill)['status'] === 'paid'
+            && abs(billPaidTotal($pdo, $partBill) - 1000) < 0.001, 'bill not paid after the full amount came in');
+    });
+
+    check('PP06', 'Undoing one payment puts the bill back to partially paid', function () use ($a, $pdo, $partBill) {
+        $pid = (int)$pdo->query("SELECT MAX(payment_id) FROM payments WHERE bill_id = $partBill")->fetchColumn();
+        $a->post('undo_payment.php', ['payment_id' => $pid, 'return' => 'payments'], 'payments.php');
+        return expect(paymentCount($pdo, $partBill) === 1 && billById($pdo, $partBill)['status'] === 'unpaid'
+            && abs(billPaidTotal($pdo, $partBill) - 400) < 0.001, 'status/balance wrong after undo');
+    });
+
+    check('PP07', 'Changing the bill amount re-checks whether payments cover it', function () use ($a, $pdo, $partBill) {
+        $edit = fn(string $amount) => $a->post('edit_bill.php', [
+            'bill_id' => $partBill, 'bill_name' => 'Audit Tuition', 'amount' => $amount,
+            'due_date' => date('Y-m-d', strtotime('+6 days')), 'category_id' => '4',
+        ], "edit_bill.php?bill_id=$partBill");
+        $edit('400.00');
+        $lowered = billById($pdo, $partBill)['status'];
+        $edit('900.00');
+        $raised = billById($pdo, $partBill)['status'];
+        return expect($lowered === 'paid' && $raised === 'unpaid', "after lowering: $lowered, after raising: $raised");
+    });
+
+    check('PP08', 'Concurrent-style double submit cannot overpay (balance re-checked at save time)', function () use ($a, $pdo, $partBill) {
+        // Two tabs opened while ₱500 was owed, both paying ₱500: only the first may go through.
+        $form = $a->get("mark_paid.php?bill_id=$partBill")['body'];
+        preg_match('/name="csrf_token"\s+value="([^"]+)"/', $form, $m);
+        $data = ['bill_id' => $partBill, 'payment_date' => date('Y-m-d'), 'amount_paid' => '500', 'payment_method' => 'cash', 'csrf_token' => $m[1] ?? ''];
+        $a->request('POST', 'mark_paid.php', $data);
+        $a->request('POST', 'mark_paid.php', $data);
+        return expect(abs(billPaidTotal($pdo, $partBill) - 900) < 0.001 && billById($pdo, $partBill)['status'] === 'paid',
+            'paid total is ' . billPaidTotal($pdo, $partBill));
+    });
+
+    // =========================================================================================
+    group('NEW FEATURE — Payment receipts');
+    // =========================================================================================
+    $tmpDir = sys_get_temp_dir() . "/afterbill_audit_$stamp";
+    @mkdir($tmpDir);
+    $img = imagecreatetruecolor(20, 20);
+    imagepng($img, "$tmpDir/receipt.png");
+    file_put_contents("$tmpDir/receipt.pdf", "%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n");
+    file_put_contents("$tmpDir/shell.png", "<?php echo 'pwned'; ?>");
+    file_put_contents("$tmpDir/fake.png", "\x89PNG\r\n\x1a\n" . str_repeat('garbage', 20));
+    file_put_contents("$tmpDir/big.pdf", '%PDF-1.4' . str_repeat('A', RECEIPT_MAX_BYTES + 10));
+    file_put_contents("$tmpDir/notes.txt", 'hello');
+    $receiptPayment = function (int $billId) use ($pdo): ?array {
+        $s = $pdo->prepare('SELECT payment_id, receipt_file FROM payments WHERE bill_id = ? ORDER BY payment_id DESC LIMIT 1');
+        $s->execute([$billId]);
+        return $s->fetch() ?: null;
+    };
+    $rcBill = insertBill($pdo, $userA, 'Audit Receipt Bill', date('Y-m-d'), false, 'unpaid', 300.00);
+
+    check('RC01', 'Disguised or wrong files are rejected and nothing is saved: PHP renamed .png, broken PNG, text, over 5 MB',
+        function () use ($a, $pdo, $pay, $rcBill, $tmpDir) {
+            foreach (['shell.png' => 'image/png', 'fake.png' => 'image/png', 'notes.txt' => 'text/plain', 'big.pdf' => 'application/pdf'] as $f => $type) {
+                $r = $pay($a, $rcBill, '100', ['receipt' => new CURLFile("$tmpDir/$f", $type, $f)]);
+                if ($r['status'] === 302) {
+                    return "$f accepted";
+                }
+            }
+            $left = glob(receiptDir() . '/*') ?: [];
+            foreach ($left as $file) {
+                if (str_contains((string)file_get_contents($file, false, null, 0, 100), 'pwned')) {
+                    return 'the PHP file was stored';
+                }
+            }
+            return expect(paymentCount($pdo, $rcBill) === 0, 'a payment was recorded with a rejected receipt');
+        });
+
+    check('RC02', 'A PNG receipt is stored under a random name outside the web root path', function () use ($a, $pay, $rcBill, $tmpDir, $receiptPayment) {
+        $r = $pay($a, $rcBill, '100', ['receipt' => new CURLFile("$tmpDir/receipt.png", 'image/png', '../../evil.php')]);
+        $p = $receiptPayment($rcBill);
+        if ($r['status'] !== 302 || !$p || $p['receipt_file'] === null) {
+            return 'receipt not saved';
+        }
+        return expect(preg_match('/^[0-9a-f]{32}\.png$/', $p['receipt_file']) && is_file(receiptPath($p['receipt_file'])),
+            'unexpected stored name: ' . $p['receipt_file']);
+    });
+
+    check('RC03', 'Owner can open the receipt; it is sent with its real type and nosniff', function () use ($a, $rcBill, $receiptPayment) {
+        $p = $receiptPayment($rcBill);
+        $r = $a->get("receipt.php?payment_id={$p['payment_id']}");
+        return expect($r['status'] === 200 && stripos($r['headers'], 'Content-Type: image/png') !== false
+            && stripos($r['headers'], 'X-Content-Type-Options: nosniff') !== false && str_starts_with($r['body'], "\x89PNG"),
+            "receipt not served correctly ({$r['status']})");
+    });
+
+    check('RC04', "Another user gets 404 for someone's receipt; logged-out users go to login", function () use ($b, $anon, $rcBill, $receiptPayment) {
+        $p = $receiptPayment($rcBill);
+        $other = $b->get("receipt.php?payment_id={$p['payment_id']}");
+        $loggedOut = $anon->get("receipt.php?payment_id={$p['payment_id']}");
+        return expect($other['status'] === 404 && !str_starts_with($other['body'], "\x89PNG")
+            && $loggedOut['status'] === 302 && str_contains($loggedOut['location'], 'login.php'),
+            "other user: {$other['status']}, logged out: {$loggedOut['status']}");
+    });
+
+    check('RC05', 'Stored receipt files cannot be downloaded directly from storage/', function () use ($a, $rcBill, $receiptPayment) {
+        $p = $receiptPayment($rcBill);
+        $r = $a->get('storage/receipts/' . $p['receipt_file']);
+        return expect(in_array($r['status'], [403, 404], true), "direct URL returned {$r['status']}");
+    });
+
+    check('RC06', 'Payment History links the receipt; a PDF receipt downloads instead of opening inline',
+        function () use ($a, $pay, $rcBill, $tmpDir, $receiptPayment) {
+            if (!str_contains($a->get('payments.php')['body'], 'receipt.php?payment_id=')) {
+                return 'no receipt link on Payment History';
+            }
+            $pay($a, $rcBill, '50', ['receipt' => new CURLFile("$tmpDir/receipt.pdf", 'application/pdf', 'r.pdf')]);
+            $p = $receiptPayment($rcBill);
+            $r = $a->get("receipt.php?payment_id={$p['payment_id']}");
+            return expect($r['status'] === 200 && stripos($r['headers'], 'Content-Disposition: attachment') !== false,
+                'PDF not served as a download');
+        });
+
+    check('RC07', 'Undoing a payment deletes its receipt file', function () use ($a, $pdo, $rcBill, $receiptPayment) {
+        $p = $receiptPayment($rcBill);
+        $path = receiptPath($p['receipt_file']);
+        $a->post('undo_payment.php', ['payment_id' => $p['payment_id'], 'return' => 'payments'], 'payments.php');
+        clearstatcache();
+        return expect(!is_file($path) && paymentCount($pdo, $rcBill) === 1, 'receipt file left behind after undo');
+    });
+
+    check('RC08', "Undo Payment on My Bills (all of a bill's payments) deletes every receipt file",
+        function () use ($a, $pdo, $pay, $rcBill, $tmpDir) {
+            // Removing receipts through the app also cleans up: the files belong to the web server's
+            // user, which this CLI script may not be allowed to delete.
+            $pay($a, $rcBill, '20', ['receipt' => new CURLFile("$tmpDir/receipt.png", 'image/png', 'r.png')]);
+            $files = $pdo->query("SELECT receipt_file FROM payments WHERE bill_id = $rcBill AND receipt_file IS NOT NULL")->fetchAll(PDO::FETCH_COLUMN);
+            if (count($files) !== 2) {
+                return 'setup: expected 2 receipts, found ' . count($files);
+            }
+            $a->post('undo_payment.php', ['bill_id' => $rcBill, 'return' => 'bills'], 'bills.php');
+            clearstatcache(); // is_file() results are cached, and RC02 already looked at one of these
+            $left = array_filter($files, fn($f) => is_file(receiptPath($f)));
+            return expect(!$left && paymentCount($pdo, $rcBill) === 0 && billById($pdo, $rcBill)['status'] === 'unpaid',
+                count($left) . ' receipt file(s) left behind');
+        });
+
+    array_map('unlink', glob("$tmpDir/*") ?: []);
+    @rmdir($tmpDir);
+
+    // =========================================================================================
+    group('NEW FEATURE — Email reminders');
+    // =========================================================================================
+    $emailR = "audit_rem_{$stamp}@audit.test";
+    $rem = new Client($BASE);
+    registerUser($rem, 'Reminder Tester', $emailR, $PASS);
+    $userR = userIdByEmail($pdo, $emailR);
+    $setReminders = fn(bool $on, int $days) => $pdo->prepare('UPDATE users SET reminder_emails = ?, reminder_days = ?, last_reminder_on = NULL WHERE id = ?')
+        ->execute([$on ? 1 : 0, $days, $userR]);
+
+    check('RM01', 'With nothing due, no email is sent and the day is not used up', function () use ($pdo, $userR, $emailR) {
+        $mark = mailMark();
+        $stats = sendDueReminders($pdo, $userR);
+        $day = $pdo->query("SELECT last_reminder_on FROM users WHERE id = $userR")->fetchColumn();
+        return expect($stats['sent'] === 0 && $stats['nothing_due'] === 1 && !mailsTo($emailR, $mark) && $day === null, json_encode($stats));
+    });
+
+    check('RM02', 'Reminder lists overdue + due-soon bills with balances, and skips paid / later bills',
+        function () use ($pdo, $userR, $emailR, $setReminders) {
+            $setReminders(true, 3);
+            $late = insertBill($pdo, $userR, 'Rem Overdue Water', date('Y-m-d', strtotime('-2 days')), false, 'unpaid', 800.00);
+            $pdo->prepare("INSERT INTO payments (bill_id, payment_date, amount_paid, payment_method) VALUES (?, CURDATE(), 300, 'cash')")->execute([$late]);
+            insertBill($pdo, $userR, 'Rem Today Internet', date('Y-m-d'), false, 'unpaid', 1299.00);
+            insertBill($pdo, $userR, 'Rem Later Rent', date('Y-m-d', strtotime('+10 days')), false, 'unpaid', 9000.00);
+            insertBill($pdo, $userR, 'Rem Paid Phone', date('Y-m-d', strtotime('+1 day')), false, 'paid', 500.00);
+            $mark = mailMark();
+            $stats = sendDueReminders($pdo, $userR);
+            $mails = mailsTo($emailR, $mark);
+            if ($stats['sent'] !== 1 || count($mails) !== 1) {
+                return 'expected exactly one email, got ' . count($mails) . ' ' . json_encode($stats);
+            }
+            $m = $mails[0];
+            foreach (['1 overdue, 1 due soon' => $m['subject'], 'Rem Overdue Water: ₱500.00 left of ₱800.00, 2 days overdue' => $m['body'],
+                      'Rem Today Internet: ₱1,299.00, due today' => $m['body'], 'Total still to pay: ₱1,799.00' => $m['body'],
+                      'account.php#reminders' => $m['body']] as $needle => $hay) {
+                if (!str_contains($hay, $needle)) {
+                    return "missing \"$needle\" in: " . $hay;
+                }
+            }
+            return expect(!str_contains($m['body'], 'Rem Later Rent') && !str_contains($m['body'], 'Rem Paid Phone'),
+                'email lists a bill outside the window or a paid bill');
+        });
+
+    check('RM03', 'Running again the same day sends nothing (one email per day)', function () use ($pdo, $userR, $emailR) {
+        $mark = mailMark();
+        sendDueReminders($pdo, $userR);
+        sendDueReminders($pdo, $userR);
+        return expect(!mailsTo($emailR, $mark), 'duplicate reminder sent the same day');
+    });
+
+    check('RM04', 'A longer window includes later bills', function () use ($pdo, $userR, $emailR, $setReminders) {
+        $setReminders(true, 14);
+        $mark = mailMark();
+        sendDueReminders($pdo, $userR);
+        $mails = mailsTo($emailR, $mark);
+        return expect($mails && str_contains($mails[0]['body'], 'Rem Later Rent: ₱9,000.00, due in 10 days'), '14-day window missed the rent bill');
+    });
+
+    check('RM05', 'Turned off = no email; unverified accounts get no email', function () use ($pdo, $userR, $emailR, $setReminders, $stamp, $BASE, $PASS) {
+        $setReminders(false, 3);
+        $mark = mailMark();
+        sendDueReminders($pdo, $userR);
+        if (mailsTo($emailR, $mark)) {
+            return 'email sent although reminders are off';
+        }
+        $unverified = "audit_unv_{$stamp}@audit.test";
+        registerUser(new Client($BASE), 'Unverified', $unverified, $PASS, false);
+        $uid = userIdByEmail($pdo, $unverified);
+        insertBill($pdo, $uid, 'Unverified Bill', date('Y-m-d'));
+        $mark = mailMark();
+        sendDueReminders($pdo, $uid);
+        return expect(!array_filter(mailsTo($unverified, $mark), fn($m) => str_contains($m['subject'], 'reminder')),
+            'unverified account got a reminder');
+    });
+
+    check('RM06', 'Account page saves reminder settings, rejects bad values and forged requests, and logs the change',
+        function () use ($rem, $pdo, $userR) {
+            $get = fn() => array_map('intval', $pdo->query("SELECT reminder_emails, reminder_days FROM users WHERE id = $userR")->fetch(PDO::FETCH_NUM));
+            $r = $rem->post('account.php', ['action' => 'reminders', 'reminder_emails' => '1', 'reminder_days' => '7']);
+            if ($r['status'] !== 302 || $get() !== [1, 7]) {
+                return 'valid settings not saved: ' . json_encode($get());
+            }
+            $rem->post('account.php', ['action' => 'reminders', 'reminder_emails' => '1', 'reminder_days' => '99']);
+            $rem->postRaw('account.php', ['action' => 'reminders', 'reminder_days' => '1']); // no CSRF token: tries to turn off
+            if ($get() !== [1, 7]) {
+                return 'invalid or forged settings were saved: ' . json_encode($get());
+            }
+            $rem->post('account.php', ['action' => 'reminders', 'reminder_days' => '3']); // unticked = off
+            $log = $pdo->query("SELECT details FROM activity_log WHERE user_id = $userR AND action = 'reminders_updated' ORDER BY log_id DESC LIMIT 1")->fetchColumn();
+            return expect($get() === [0, 3] && $log === 'Email reminders off', 'turning off failed: ' . json_encode($get()) . " / $log");
+        });
+
+    check('RM07', 'The cron script is CLI-only: blocked over HTTP; --dry-run sends nothing', function () use ($anon, $pdo, $userR, $emailR, $setReminders) {
+        $r = $anon->get('cron/send_reminders.php');
+        if (!in_array($r['status'], [403, 404], true)) {
+            return "cron script reachable over HTTP ({$r['status']})";
+        }
+        $setReminders(true, 3);
+        $mark = mailMark();
+        $out = shell_exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(__DIR__ . '/../cron/send_reminders.php') . " --dry-run --user=$userR 2>&1");
+        $day = $pdo->query("SELECT last_reminder_on FROM users WHERE id = $userR")->fetchColumn();
+        return expect(str_contains((string)$out, '[dry run]') && str_contains((string)$out, 'Rem Overdue Water') && !mailsTo($emailR, $mark) && $day === null,
+            'dry run output/side effects wrong: ' . substr((string)$out, 0, 200));
+    });
+
+    // =========================================================================================
+    group('ROUND 3 — Totals count partial payments (dashboard, reports, PDF)');
+    // =========================================================================================
+    $emailD = "audit_d_{$stamp}@audit.test";
+    $d = new Client($BASE);
+    registerUser($d, 'Audit User D', $emailD, $PASS);
+    $userD = userIdByEmail($pdo, $emailD);
+    $todayD = (string)$pdo->query('SELECT CURDATE()')->fetchColumn();
+    $dPaid = insertBill($pdo, $userD, 'D Paid Rent', $todayD, false, 'paid', 1000.00, 3);
+    $pdo->prepare("INSERT INTO payments (bill_id, payment_date, amount_paid, payment_method) VALUES (?, CURDATE(), 1000, 'cash')")->execute([$dPaid]);
+    $dPartial = insertBill($pdo, $userD, 'D Partial Water', $todayD, false, 'unpaid', 600.00, 1);
+    $pdo->prepare("INSERT INTO payments (bill_id, payment_date, amount_paid, payment_method) VALUES (?, CURDATE(), 200, 'gcash')")->execute([$dPartial]);
+    $dUnpaid = insertBill($pdo, $userD, 'D Unpaid Phone', $todayD, false, 'unpaid', 400.00, 2);
+
+    check('TP01', 'Dashboard counts what was actually paid: paid ₱1,200, still owed ₱800 (partial bill split)', function () use ($d, $statValues) {
+        $v = $statValues($d->get('dashboard.php')['body']);
+        return expect(($v[0] ?? '') === '3' && ($v[1] ?? '') === '₱1,200.00' && ($v[2] ?? '') === '₱800.00' && ($v[5] ?? '') === '₱2,000.00',
+            'shown ' . json_encode($v, JSON_UNESCAPED_UNICODE));
+    });
+
+    check('TP02', 'Reports shows the same paid / still-owed split and mentions the partly paid bill', function () use ($d) {
+        $body = $d->get('reports.php')['body'];
+        foreach (['₱1,200.00', '₱800.00', '₱2,000.00', '1 partly paid'] as $needle) {
+            if (!str_contains($body, $needle)) {
+                return "reports.php does not show $needle";
+            }
+        }
+        return true;
+    });
+
+    check('TP03', 'Dashboard 6-month chart: SVG chart, legend and a table with this month\'s numbers', function () use ($d, $BASE, $PASS, $stamp) {
+        $body = $d->get('dashboard.php')['body'];
+        if (!str_contains($body, 'Last 6 months') || !preg_match('#<svg viewBox="0 0 640 206"#', $body) || !str_contains($body, 'Show as table')) {
+            return 'chart, legend or table missing';
+        }
+        $row = (new DateTime())->format('F Y') . '</td>';
+        $at = strpos($body, $row);
+        $seg = $at === false ? '' : substr($body, $at, 300);
+        if (!str_contains($seg, '₱1,200.00') || !str_contains($seg, '₱800.00') || !str_contains($seg, '₱2,000.00')) {
+            return "this month's table row is wrong: " . strip_tags($seg);
+        }
+        // A brand-new account sees a friendly empty state instead of an empty chart.
+        $fresh = new Client($BASE);
+        registerUser($fresh, 'Empty Chart', "audit_empty_{$stamp}@audit.test", $PASS);
+        return expect(str_contains($fresh->get('dashboard.php')['body'], 'No bills in the last 6 months'), 'no empty state');
+    });
+
+    check('TP04', 'Monthly report downloads as a real PDF; junk month falls back; logged-out users go to login', function () use ($d, $anon) {
+        $r = $d->get('report_pdf.php?month=' . date('Y-m'));
+        if ($r['status'] !== 200 || stripos($r['headers'], 'Content-Type: application/pdf') === false || !str_starts_with($r['body'], '%PDF-')) {
+            return "not a PDF ({$r['status']})";
+        }
+        if (stripos($r['headers'], 'attachment; filename="afterbill-report-' . date('Y-m') . '.pdf"') === false) {
+            return 'wrong download name';
+        }
+        $junk = $d->get('report_pdf.php?month=../../etc');
+        $out = $anon->get('report_pdf.php');
+        return expect(str_starts_with($junk['body'], '%PDF-') && $out['status'] === 302 && str_contains($out['location'], 'login.php'),
+            'junk month or logged-out access handled wrong');
+    });
+
+    check('TP05', 'Reports page links to the PDF for the selected month', function () use ($d) {
+        return expect(str_contains($d->get('reports.php?month=2026-03')['body'], 'report_pdf.php?month=2026-03'), 'no PDF link');
+    });
+
+    // =========================================================================================
+    group('ROUND 3 — Attach a receipt later');
+    // =========================================================================================
+    $tmp3 = sys_get_temp_dir() . "/afterbill_audit3_$stamp";
+    @mkdir($tmp3);
+    imagepng(imagecreatetruecolor(12, 12), "$tmp3/r.png");
+    file_put_contents("$tmp3/evil.png", "<?php echo 'x'; ?>");
+    $dPayId = (int)$pdo->query("SELECT payment_id FROM payments WHERE bill_id = $dPartial")->fetchColumn();
+    $receiptOf = fn(int $pid) => $pdo->query("SELECT receipt_file FROM payments WHERE payment_id = $pid")->fetchColumn();
+
+    check('AR01', 'A receipt can be attached to an existing payment from Payment History', function () use ($d, $dPayId, $tmp3, $receiptOf) {
+        if (!str_contains($d->get('payments.php')['body'], 'action="attach_receipt.php"')) {
+            return 'no attach control on Payment History';
+        }
+        $r = $d->post('attach_receipt.php', ['payment_id' => $dPayId, 'receipt' => new CURLFile("$tmp3/r.png", 'image/png', 'r.png')], 'payments.php');
+        $file = $receiptOf($dPayId);
+        clearstatcache();
+        return expect(str_contains($r['location'], 'receipt=attached') && $file && is_file(receiptPath($file)), 'receipt not attached');
+    });
+
+    check('AR02', 'Replacing a receipt deletes the old file', function () use ($d, $dPayId, $tmp3, $receiptOf) {
+        $old = $receiptOf($dPayId);
+        $d->post('attach_receipt.php', ['payment_id' => $dPayId, 'receipt' => new CURLFile("$tmp3/r.png", 'image/png', 'r.png')], 'payments.php');
+        $new = $receiptOf($dPayId);
+        clearstatcache();
+        return expect($new && $new !== $old && !is_file(receiptPath($old)) && is_file(receiptPath($new)), 'old file kept or new file missing');
+    });
+
+    check('AR03', "Bad files are refused with a message (not taken from the URL); another user can't attach or remove",
+        function () use ($d, $b, $dPayId, $tmp3, $receiptOf) {
+            $before = $receiptOf($dPayId);
+            $r = $d->post('attach_receipt.php', ['payment_id' => $dPayId, 'receipt' => new CURLFile("$tmp3/evil.png", 'image/png', 'e.png')], 'payments.php');
+            $page = $d->get('payments.php')['body'];
+            if ($receiptOf($dPayId) !== $before || !str_contains($page, 'Receipts must be a JPG')) {
+                return 'disguised file accepted or no error shown';
+            }
+            $spoof = $d->get('payments.php?receipt=error&receipt_error=' . urlencode('Call 0900 to claim a prize'))['body'];
+            if (str_contains($spoof, 'claim a prize')) {
+                return 'error text taken from the URL';
+            }
+            $b->post('attach_receipt.php', ['payment_id' => $dPayId, 'remove' => '1'], 'payments.php');
+            $b->post('attach_receipt.php', ['payment_id' => $dPayId, 'receipt' => new CURLFile("$tmp3/r.png", 'image/png', 'r.png')], 'payments.php');
+            return expect($receiptOf($dPayId) === $before, "another user changed the receipt");
+        });
+
+    check('AR04', 'Removing a receipt keeps the payment and deletes the file; forged request does nothing', function () use ($d, $pdo, $dPayId, $receiptOf) {
+        $file = $receiptOf($dPayId);
+        $d->postRaw('attach_receipt.php', ['payment_id' => $dPayId, 'remove' => '1']);
+        if ($receiptOf($dPayId) !== $file) {
+            return 'forged request removed the receipt';
+        }
+        $d->post('attach_receipt.php', ['payment_id' => $dPayId, 'remove' => '1'], 'payments.php');
+        clearstatcache();
+        $exists = (int)$pdo->query("SELECT COUNT(*) FROM payments WHERE payment_id = $dPayId")->fetchColumn();
+        return expect($receiptOf($dPayId) === null && !is_file(receiptPath($file)) && $exists === 1, 'receipt not removed cleanly');
+    });
+
+    // =========================================================================================
+    group('ROUND 3 — Budget alerts in the reminder email');
+    // =========================================================================================
+    check('BA01', 'Reminder email lists budgets over / near their limit and says so in the subject', function () use ($pdo, $userD, $emailD) {
+        $pdo->prepare('INSERT INTO budgets (user_id, category_id, monthly_limit) VALUES (?, 1, 500), (?, 2, 420)')->execute([$userD, $userD]);
+        $pdo->prepare('UPDATE users SET reminder_emails = 1, reminder_days = 3, last_reminder_on = NULL WHERE id = ?')->execute([$userD]);
+        $mark = mailMark();
+        sendDueReminders($pdo, $userD);
+        $m = mailsTo($emailD, $mark)[0] ?? null;
+        if (!$m) {
+            return 'no reminder sent';
+        }
+        foreach (['over budget' => $m['subject'], 'BUDGETS THIS MONTH' => $m['body'],
+                  'Utilities: ₱600.00 of ₱500.00 (120%), over by ₱100.00' => $m['body'],
+                  'Internet: ₱400.00 of ₱420.00 (95%), near the limit' => $m['body'], 'budgets.php' => $m['body']] as $needle => $hay) {
+            if (!str_contains($hay, $needle)) {
+                return "missing \"$needle\"";
+            }
+        }
+        return true;
+    });
+
+    // =========================================================================================
+    group('ROUND 3 — Repeat schedules');
+    // =========================================================================================
+    $series = function (string $name) use ($pdo, $userD): array {
+        $s = $pdo->prepare('SELECT due_date FROM bills WHERE user_id = ? AND bill_name = ? ORDER BY due_date');
+        $s->execute([$userD, $name]);
+        return $s->fetchAll(PDO::FETCH_COLUMN);
+    };
+    $addRepeating = fn(string $name, string $due, array $repeat) => $d->post('add_bill.php', array_merge([
+        'bill_name' => $name, 'amount' => '100', 'due_date' => $due, 'category_id' => '7', 'is_recurring' => '1',
+    ], $repeat));
+    $tenth = fn(int $monthsAgo) => (new DateTime('first day of this month'))->modify("-$monthsAgo months")->format('Y-m-10');
+
+    check('RS01', 'Weekly bill generates a bill every 7 days', function () use ($d, $addRepeating, $series) {
+        $addRepeating('RS Weekly Allowance', date('Y-m-d', strtotime('-15 days')), ['repeat_interval' => 'weekly', 'repeat_end' => 'never']);
+        $d->get('bills.php');
+        $dates = $series('RS Weekly Allowance');
+        $expected = array_map(fn($n) => date('Y-m-d', strtotime(($n - 15) . ' days')), [0, 7, 14, 21]);
+        return expect($dates === $expected, 'got ' . implode(', ', $dates) . ' expected ' . implode(', ', $expected));
+    });
+
+    check('RS02', 'Every-3-months and yearly bills keep their own months and day', function () use ($d, $addRepeating, $series, $tenth) {
+        $addRepeating('RS Quarterly Tax', $tenth(7), ['repeat_interval' => 'quarterly', 'repeat_end' => 'never']);
+        $addRepeating('RS Yearly Insurance', $tenth(14), ['repeat_interval' => 'yearly', 'repeat_end' => 'never']);
+        $d->get('bills.php');
+        $q = $series('RS Quarterly Tax');
+        $y = $series('RS Yearly Insurance');
+        $minus = fn(int $m) => $m >= 0 ? $tenth($m) : (new DateTime('first day of this month'))->modify('+' . (-$m) . ' months')->format('Y-m-10');
+        $qExp = [$minus(7), $minus(4), $minus(1), $minus(-2)];
+        $yExp = [$minus(14), $minus(2), $minus(-10)];
+        if ($q !== $qExp) {
+            return 'quarterly: ' . implode(', ', $q) . ' expected ' . implode(', ', $qExp);
+        }
+        return expect($y === $yExp, 'yearly: ' . implode(', ', $y) . ' expected ' . implode(', ', $yExp));
+    });
+
+    check('RS03', '"Ends on" stops the series at the end date', function () use ($d, $addRepeating, $series) {
+        $addRepeating('RS Ending Gym', date('Y-m-d', strtotime('-15 days')),
+            ['repeat_interval' => 'weekly', 'repeat_end' => 'on', 'repeat_until' => date('Y-m-d', strtotime('-5 days'))]);
+        $d->get('bills.php');
+        $d->get('dashboard.php');
+        return expect(count($series('RS Ending Gym')) === 2, 'expected 2 bills, got ' . count($series('RS Ending Gym')));
+    });
+
+    check('RS04', '"Ends after N bills" stores the N-th date and creates exactly N bills', function () use ($d, $pdo, $userD, $addRepeating, $series, $tenth) {
+        $addRepeating('RS Three Payments', $tenth(3), ['repeat_interval' => 'monthly', 'repeat_end' => 'after', 'repeat_count' => '3']);
+        $d->get('bills.php');
+        $until = $pdo->query("SELECT repeat_until FROM bills WHERE user_id = $userD AND bill_name = 'RS Three Payments' ORDER BY due_date LIMIT 1")->fetchColumn();
+        return expect($until === $tenth(1) && count($series('RS Three Payments')) === 3,
+            "until=$until bills=" . count($series('RS Three Payments')));
+    });
+
+    check('RS05', 'Invalid schedules are rejected: unknown interval, end before due date, 1 or 9999 bills', function () use ($d, $pdo, $userD) {
+        $base = ['bill_name' => 'RS Bad', 'amount' => '10', 'due_date' => date('Y-m-d'), 'category_id' => '1', 'is_recurring' => '1'];
+        foreach ([['repeat_interval' => 'daily'],
+                  ['repeat_interval' => 'monthly', 'repeat_end' => 'on', 'repeat_until' => date('Y-m-d', strtotime('-1 day'))],
+                  ['repeat_interval' => 'monthly', 'repeat_end' => 'after', 'repeat_count' => '1'],
+                  ['repeat_interval' => 'monthly', 'repeat_end' => 'after', 'repeat_count' => '9999']] as $bad) {
+            if ($d->post('add_bill.php', $base + $bad)['status'] === 302) {
+                return 'accepted: ' . json_encode($bad);
+            }
+        }
+        return expect((int)$pdo->query("SELECT COUNT(*) FROM bills WHERE user_id = $userD AND bill_name = 'RS Bad'")->fetchColumn() === 0, 'bad bill saved');
+    });
+
+    check('RS06', 'My Bills shows the schedule; editing changes it', function () use ($d, $pdo, $userD) {
+        if (!str_contains($d->get('bills.php?q=RS+Weekly')['body'], '>Weekly</span>')) {
+            return 'weekly tag not shown';
+        }
+        $id = (int)$pdo->query("SELECT bill_id FROM bills WHERE user_id = $userD AND bill_name = 'RS Weekly Allowance' ORDER BY due_date DESC LIMIT 1")->fetchColumn();
+        $due = $pdo->query("SELECT due_date FROM bills WHERE bill_id = $id")->fetchColumn();
+        $d->post('edit_bill.php', ['bill_id' => $id, 'bill_name' => 'RS Weekly Allowance', 'amount' => '100', 'due_date' => $due,
+            'category_id' => '7', 'is_recurring' => '1', 'repeat_interval' => 'yearly', 'repeat_end' => 'never'], "edit_bill.php?bill_id=$id");
+        return expect($pdo->query("SELECT repeat_interval FROM bills WHERE bill_id = $id")->fetchColumn() === 'yearly', 'schedule not changed');
+    });
+
+    // =========================================================================================
+    group('ROUND 3 — Pay several bills at once');
+    // =========================================================================================
+    check('BP01', 'Pay selected: pays the full remaining balance of each ticked bill, skips paid and other users\' bills',
+        function () use ($d, $pdo, $userA, $dPartial, $dUnpaid, $dPaid) {
+            $foreign = insertBill($pdo, $userA, 'Not D Bill', date('Y-m-d'));
+            $paymentsBefore = paymentCount($pdo, $dPaid);
+            $d->post('bulk_pay.php', ['bill_ids' => [(string)$dPartial, (string)$dUnpaid, (string)$dPaid, (string)$foreign],
+                'payment_date' => date('Y-m-d'), 'payment_method' => 'gcash'], 'bills.php');
+            $ok = billById($pdo, $dPartial)['status'] === 'paid' && abs(billPaidTotal($pdo, $dPartial) - 600) < 0.001
+                && billById($pdo, $dUnpaid)['status'] === 'paid' && abs(billPaidTotal($pdo, $dUnpaid) - 400) < 0.001
+                && paymentCount($pdo, $dPaid) === $paymentsBefore && paymentCount($pdo, $foreign) === 0;
+            $pdo->exec("DELETE FROM bills WHERE bill_id = $foreign");
+            return expect($ok, 'balances not paid correctly, or a paid / foreign bill was touched');
+        });
+
+    check('BP02', 'Pay selected rejects: no CSRF token, future date, unknown method, nothing ticked', function () use ($d, $pdo, $userD) {
+        $bill = insertBill($pdo, $userD, 'BP Target', date('Y-m-d'));
+        $base = ['bill_ids' => [(string)$bill], 'payment_date' => date('Y-m-d'), 'payment_method' => 'cash'];
+        $d->postRaw('bulk_pay.php', $base);
+        $d->post('bulk_pay.php', ['payment_date' => date('Y-m-d', strtotime('+3 days'))] + $base, 'bills.php');
+        $d->post('bulk_pay.php', ['payment_method' => 'bitcoin'] + $base, 'bills.php');
+        $d->post('bulk_pay.php', ['bill_ids' => []] + $base, 'bills.php');
+        $ok = paymentCount($pdo, $bill) === 0;
+        $page = $d->get('bills.php')['body']; // the last error is shown once
+        return expect($ok && str_contains($page, 'Tick at least one bill'), 'an invalid bulk payment went through, or no error shown');
+    });
+
+    check('BP03', 'My Bills has the Pay selected bar and a checkbox per unpaid bill only', function () use ($d, $pdo, $userD) {
+        $body = $d->get('bills.php')['body'];
+        $unpaid = (int)$pdo->query("SELECT COUNT(*) FROM bills WHERE user_id = $userD AND status = 'unpaid'")->fetchColumn();
+        $boxes = preg_match_all('/name="bill_ids\[\]"/', $body);
+        return expect(str_contains($body, 'id="bulk-pay"') && $boxes === $unpaid && str_contains($body, 'data-check-all'),
+            "checkboxes: $boxes, unpaid bills: $unpaid");
+    });
+
+    // =========================================================================================
+    group('ROUND 3 — Mobile layout');
+    // =========================================================================================
+    check('MB01', 'Every app page has the mobile menu button and its script', function () use ($d) {
+        foreach (['dashboard.php', 'bills.php', 'add_bill.php', 'calendar.php', 'payments.php', 'reports.php', 'budgets.php',
+                  'categories.php', 'reminders.php', 'account.php', 'activity.php'] as $p) {
+            $body = $d->get($p)['body'];
+            if (!str_contains($body, 'class="nav-toggle"') || !str_contains($body, 'assets/js/nav.js') || !str_contains($body, 'id="app-sidebar"')) {
+                return "$p has no mobile menu";
+            }
+        }
+        return true;
+    });
+
+    // =========================================================================================
+    group('ROUND 3 — Two-factor login');
+    // =========================================================================================
+    $emailT = "audit_t_{$stamp}@audit.test";
+    $t = new Client($BASE);
+    registerUser($t, 'Audit Two Factor', $emailT, $PASS);
+    $userT = userIdByEmail($pdo, $emailT);
+    $secretT = null;
+    $recoveryT = [];
+
+    check('TF01', 'Setup shows a QR code and key; wrong code or password does not turn it on', function () use ($t, $pdo, $userT, $PASS, &$secretT) {
+        $t->post('account.php', ['action' => '2fa_start']);
+        $page = $t->get('account.php')['body'];
+        if (!preg_match('/class="secret-key">([A-Z2-7 ]+)</', $page, $m) || !str_contains($page, 'src="data:image/svg+xml;base64,')) {
+            return 'no QR code / key on the setup screen';
+        }
+        $secretT = str_replace(' ', '', $m[1]);
+        $t->post('account.php', ['action' => '2fa_enable', 'code' => '000000', 'current_password' => $PASS]);
+        $t->post('account.php', ['action' => '2fa_enable', 'code' => totpCode($secretT, totpCurrentStep()), 'current_password' => 'Wrong#Pass1']);
+        return expect(!twoFactorEnabled($pdo, $userT), 'enabled with a wrong code or password');
+    });
+
+    check('TF02', 'Right code + password turns it on and shows 8 recovery codes once; secret is stored, codes only as hashes',
+        function () use ($t, $pdo, $userT, $PASS, &$secretT, &$recoveryT) {
+            $r = $t->post('account.php', ['action' => '2fa_enable', 'code' => totpCode($secretT, totpCurrentStep()), 'current_password' => $PASS]);
+            $page = $t->get('account.php')['body'];
+            preg_match_all('/<span>([0-9a-f]{5}-[0-9a-f]{5})<\/span>/', $page, $m);
+            $recoveryT = $m[1];
+            $again = $t->get('account.php')['body'];
+            $hashes = $pdo->query("SELECT code_hash FROM user_recovery_codes WHERE user_id = $userT")->fetchAll(PDO::FETCH_COLUMN);
+            return expect(twoFactorEnabled($pdo, $userT) && count($recoveryT) === 8 && !preg_match('/<span>[0-9a-f]{5}-[0-9a-f]{5}<\/span>/', $again)
+                && count($hashes) === 8 && !in_array($recoveryT[0], $hashes, true) && in_array(recoveryCodeHash($recoveryT[0]), $hashes, true),
+                'enable failed, codes not shown exactly once, or not hashed');
+        });
+
+    check('TF03', 'Login now stops after the password: not signed in until the code is entered', function () use ($BASE, $emailT, $PASS) {
+        $c = new Client($BASE);
+        $r = login($c, $emailT, $PASS);
+        $dash = $c->get('dashboard.php');
+        return expect(str_contains($r['location'], 'two_factor.php') && $dash['status'] === 302, 'signed in without a code');
+    });
+
+    check('TF04', 'Wrong code is refused and logged; the right code signs in; the same code cannot be used again',
+        function () use ($BASE, $emailT, $PASS, $pdo, $userT, &$secretT) {
+            $c = new Client($BASE);
+            login($c, $emailT, $PASS);
+            $bad = $c->post('auth/two_factor.php', ['code' => '123456']);
+            if ($bad['status'] === 302 || !str_contains($bad['body'], 'didn')) {
+                return 'wrong code accepted or no error';
+            }
+            $fail = (int)$pdo->query("SELECT COUNT(*) FROM activity_log WHERE user_id = $userT AND action = 'login_failed' AND details = 'Wrong two-factor code'")->fetchColumn();
+            $code = totpCode($secretT, totpCurrentStep() + 1); // steps used in TF02 are spent
+            $ok = $c->post('auth/two_factor.php', ['code' => $code]);
+            if (!str_contains($ok['location'], 'dashboard.php') || $c->get('dashboard.php')['status'] !== 200) {
+                return 'right code did not sign in';
+            }
+            $c2 = new Client($BASE);
+            login($c2, $emailT, $PASS);
+            $replay = $c2->post('auth/two_factor.php', ['code' => $code]);
+            return expect($fail >= 1 && $replay['status'] !== 302, 'failed code not logged, or a used code worked twice');
+        });
+
+    check('TF05', 'A recovery code works once', function () use ($BASE, $emailT, $PASS, &$recoveryT) {
+        $c = new Client($BASE);
+        login($c, $emailT, $PASS);
+        $r = $c->post('auth/two_factor.php', ['code' => strtoupper($recoveryT[0])]);
+        if ($c->get('dashboard.php')['status'] !== 200) {
+            return 'recovery code did not sign in (' . $r['location'] . ')';
+        }
+        $c2 = new Client($BASE);
+        login($c2, $emailT, $PASS);
+        $again = $c2->post('auth/two_factor.php', ['code' => $recoveryT[0]]);
+        return expect($again['status'] !== 302 && $c2->get('dashboard.php')['status'] === 302, 'recovery code worked twice');
+    });
+
+    check('TF06', 'Five wrong codes send the user back to the password; the code page needs a password step first',
+        function () use ($BASE, $emailT, $PASS, $anon) {
+            if ($anon->get('auth/two_factor.php')['status'] !== 302) {
+                return 'code page reachable without a password step';
+            }
+            $c = new Client($BASE);
+            login($c, $emailT, $PASS);
+            $last = null;
+            for ($i = 0; $i < 5; $i++) {
+                $last = $c->post('auth/two_factor.php', ['code' => '00000' . $i]);
+            }
+            $after = $c->get('auth/two_factor.php');
+            clearRateLimits();
+            return expect(str_contains((string)$last['location'], 'two_factor_failed') && $after['status'] === 302,
+                'still allowed to guess after 5 wrong codes');
+        });
+
+    check('TF07', 'Turning it off needs the password and a current code', function () use ($t, $pdo, $userT, $PASS, &$secretT) {
+        // TF04 already used the newest step the ±1 window allows; treat earlier codes as old so a
+        // current code is valid (instead of waiting up to 30 s for the clock).
+        $pdo->exec("UPDATE users SET totp_last_step = NULL WHERE id = $userT");
+        $t->post('account.php', ['action' => '2fa_disable', 'current_password' => $PASS, 'code' => '000000']);
+        if (!twoFactorEnabled($pdo, $userT)) {
+            return 'turned off without a valid code';
+        }
+        $t->post('account.php', ['action' => '2fa_disable', 'current_password' => $PASS, 'code' => totpCode($secretT, totpCurrentStep())]);
+        $codes = (int)$pdo->query("SELECT COUNT(*) FROM user_recovery_codes WHERE user_id = $userT")->fetchColumn();
+        return expect(!twoFactorEnabled($pdo, $userT) && $codes === 0, 'not turned off, or recovery codes left behind');
+    });
+
+    // =========================================================================================
+    group('ROUND 3 — Signed-in devices');
+    // =========================================================================================
+    $emailS = "audit_s_{$stamp}@audit.test";
+    $s1 = new Client($BASE);
+    registerUser($s1, 'Audit Sessions', $emailS, $PASS);
+    $userS = userIdByEmail($pdo, $emailS);
+    $s2 = new Client($BASE);
+    login($s2, $emailS, $PASS);
+    $rowOf = function (Client $c) use ($pdo): ?int {
+        $s = $pdo->prepare('SELECT id FROM user_sessions WHERE session_hash = ?');
+        $s->execute([hash('sha256', $c->cookies['PHPSESSID'] ?? '')]);
+        $id = $s->fetchColumn();
+        return $id === false ? null : (int)$id;
+    };
+
+    check('SD01', 'Both browsers are listed; this one is marked; only a hash of the session id is stored', function () use ($s1, $s2, $pdo, $userS, $rowOf) {
+        $page = $s1->get('account.php')['body'];
+        $raw = $s1->cookies['PHPSESSID'] ?? '';
+        $leak = (int)$pdo->query("SELECT COUNT(*) FROM user_sessions WHERE session_hash = " . $pdo->quote($raw))->fetchColumn();
+        return expect(substr_count($page, 'class="device-name"') === 2 && str_contains($page, 'This device')
+            && $rowOf($s1) !== null && $rowOf($s2) !== null && $leak === 0, 'devices not listed correctly');
+    });
+
+    check('SD02', "Another user can't sign out someone's device; a forged request does nothing", function () use ($b, $s1, $s2, $rowOf) {
+        $id = $rowOf($s2);
+        $b->post('account.php', ['action' => 'revoke_session', 'session_id' => $id]);
+        $s1->postRaw('account.php', ['action' => 'revoke_session', 'session_id' => $id]);
+        return expect($rowOf($s2) === $id && $s2->get('dashboard.php')['status'] === 200, 'device was signed out');
+    });
+
+    check('SD03', 'Signing out a device ends that session on its next request (with a message)', function () use ($s1, $s2, $rowOf) {
+        $s1->post('account.php', ['action' => 'revoke_session', 'session_id' => $rowOf($s2)]);
+        $r = $s2->get('dashboard.php');
+        return expect($r['status'] === 302 && str_contains($r['location'], 'reason=revoked') && $s1->get('dashboard.php')['status'] === 200,
+            "revoked device still signed in ({$r['status']} {$r['location']})");
+    });
+
+    check('SD04', '"Sign out all other devices" keeps this one; logout removes the device row', function () use ($BASE, $s1, $emailS, $PASS, $rowOf) {
+        $x = new Client($BASE);
+        login($x, $emailS, $PASS);
+        $y = new Client($BASE);
+        login($y, $emailS, $PASS);
+        $s1->post('account.php', ['action' => 'revoke_others']);
+        if ($x->get('dashboard.php')['status'] !== 302 || $y->get('dashboard.php')['status'] !== 302 || $s1->get('dashboard.php')['status'] !== 200) {
+            return 'other devices not signed out, or this one was';
+        }
+        $z = new Client($BASE);
+        login($z, $emailS, $PASS);
+        $id = $rowOf($z);
+        $z->post('auth/logout.php', [], 'dashboard.php');
+        return expect($id !== null && $rowOf($z) === null, 'logout left the device row');
+    });
+
+    // =========================================================================================
+    group('ROUND 3 — Download my data');
+    // =========================================================================================
+    check('DX01', 'Wrong password: no download', function () use ($d) {
+        $r = $d->post('account.php', ['action' => 'export_data', 'current_password' => 'Nope#Wrong1']);
+        return expect(stripos($r['headers'], 'application/zip') === false && str_contains($r['body'], 'Current password is incorrect'), 'export without the password');
+    });
+
+    check('DX02', 'ZIP has every file, only this user\'s data, receipts, escaped formulas, and no password hash',
+        function () use ($d, $pdo, $userD, $PASS, $tmp3, $dPayId) {
+            $pdo->prepare("INSERT INTO bills (user_id, bill_name, amount, due_date, category_id) VALUES (?, '=HYPERLINK(\"x\")', 1, CURDATE(), 1)")->execute([$userD]);
+            $d->post('attach_receipt.php', ['payment_id' => $dPayId, 'receipt' => new CURLFile("$tmp3/r.png", 'image/png', 'r.png')], 'payments.php');
+            $r = $d->post('account.php', ['action' => 'export_data', 'current_password' => $PASS]);
+            if (stripos($r['headers'], 'Content-Type: application/zip') === false) {
+                return 'not a ZIP download';
+            }
+            $zipPath = "$tmp3/export.zip";
+            file_put_contents($zipPath, $r['body']);
+            $zip = new ZipArchive();
+            if ($zip->open($zipPath) !== true) {
+                return 'ZIP does not open';
+            }
+            foreach (['README.txt', 'profile.json', 'bills.csv', 'payments.csv', 'budgets.csv', 'categories.csv', 'activity_log.csv'] as $f) {
+                if ($zip->locateName($f) === false) {
+                    return "missing $f";
+                }
+            }
+            $bills = $zip->getFromName('bills.csv');
+            $profile = $zip->getFromName('profile.json');
+            $receipts = array_filter(array_map(fn($i) => $zip->getNameIndex($i), range(0, $zip->numFiles - 1)), fn($n) => str_starts_with($n, 'receipts/'));
+            $zip->close();
+            if (!str_contains($bills, 'D Paid Rent') || str_contains($bills, 'Audit Water') || str_contains($bills, 'Victim')) {
+                return 'bills.csv has the wrong user\'s data';
+            }
+            if (!str_contains($bills, "'=HYPERLINK")) {
+                return 'formula not escaped';
+            }
+            if (str_contains($profile, '$2y$') || str_contains($profile, 'password') && !str_contains($profile, '"full_name"')) {
+                return 'password hash in profile.json';
+            }
+            return expect(count($receipts) === 1, 'expected 1 receipt in the ZIP, found ' . count($receipts));
+        });
+
+    // Receipt files belong to the web server's user, so remove the one DX02 attached through the app.
+    $d->post('attach_receipt.php', ['payment_id' => $dPayId, 'remove' => '1'], 'payments.php');
+    array_map('unlink', glob("$tmp3/*") ?: []);
+    @rmdir($tmp3);
+
+    // =========================================================================================
+    group('ROUND 4 — Styled Excel exports');
+    // =========================================================================================
+    $xlsxSheet = function (array $r): ?array {
+        if (stripos($r['headers'], 'spreadsheetml.sheet') === false) {
+            return null;
+        }
+        $path = tempnam(sys_get_temp_dir(), 'audit-xlsx-');
+        file_put_contents($path, $r['body']);
+        $zip = new ZipArchive();
+        $files = [];
+        if ($zip->open($path) === true) {
+            foreach (['[Content_Types].xml', 'xl/workbook.xml', 'xl/styles.xml', 'xl/worksheets/sheet1.xml'] as $f) {
+                $files[$f] = $zip->getFromName($f);
+            }
+            $zip->close();
+        }
+        unlink($path);
+        return $files;
+    };
+
+    check('XL01', 'My Bills exports a well-formed, styled .xlsx with only this user\'s bills', function () use ($d, $xlsxSheet) {
+        $files = $xlsxSheet($d->get('bills.php?export=xlsx'));
+        if ($files === null) {
+            return 'not an Excel download';
+        }
+        foreach ($files as $name => $xml) {
+            if ($xml === false || @simplexml_load_string($xml) === false) {
+                return "$name missing or not valid XML";
+            }
+        }
+        $sheet = $files['xl/worksheets/sheet1.xml'];
+        foreach (['AfterBill — My Bills', 'D Paid Rent', 'BILL', 'Total', '<pane ySplit="4"', '<autoFilter'] as $needle) {
+            if (!str_contains($sheet, $needle)) {
+                return "sheet is missing $needle";
+            }
+        }
+        if (str_contains($sheet, 'Audit Water') || str_contains($sheet, 'Victim')) {
+            return 'another user\'s bill is in the export';
+        }
+        return expect(str_contains($files['xl/styles.xml'], 'FF17233C'), 'navy header style missing');
+    });
+
+    check('XL02', 'Excel export never turns text into a formula, and follows the filters', function () use ($d, $xlsxSheet) {
+        $sheet = $xlsxSheet($d->get('bills.php?export=xlsx'))['xl/worksheets/sheet1.xml'] ?? '';
+        if (str_contains($sheet, '<f>') || !preg_match('/t="inlineStr"><is><t xml:space="preserve">=HYPERLINK/', $sheet)) {
+            return 'formula-like bill name not stored as plain text';
+        }
+        $paidOnly = $xlsxSheet($d->get('bills.php?status=paid&export=xlsx'))['xl/worksheets/sheet1.xml'] ?? '';
+        return expect(str_contains($paidOnly, 'D Paid Rent') && !str_contains($paidOnly, 'RS Weekly') && str_contains($paidOnly, 'Status: Paid'),
+            'status filter not applied to the Excel export');
+    });
+
+    check('XL03', 'Payment History exports a styled .xlsx; both pages offer Excel and CSV', function () use ($d, $xlsxSheet) {
+        $files = $xlsxSheet($d->get('payments.php?export=xlsx'));
+        $sheet = $files['xl/worksheets/sheet1.xml'] ?? '';
+        if (!str_contains($sheet, 'AfterBill — Payment History') || !str_contains($sheet, 'D Paid Rent') || @simplexml_load_string($sheet) === false) {
+            return 'payments export wrong or invalid';
+        }
+        $bills = $d->get('bills.php')['body'];
+        $pays = $d->get('payments.php')['body'];
+        return expect(str_contains($bills, 'export=xlsx') && str_contains($bills, 'export=csv')
+            && str_contains($pays, 'export=xlsx') && str_contains($pays, 'export=csv'), 'export links missing');
+    });
+
+    // =========================================================================================
     group('SYSTEM — Links & page health');
     // =========================================================================================
     check('K01', 'Every link, script, stylesheet and image on every page resolves (no 404)', function () use ($c3, $anon) {
         $pages = [[$anon, 'index.php'], [$anon, 'auth/login.php'], [$anon, 'auth/register.php']];
         foreach (['dashboard.php', 'bills.php', 'add_bill.php', 'calendar.php', 'payments.php', 'reports.php',
-                  'budgets.php', 'reminders.php', 'account.php', 'activity.php'] as $p) {
+                  'budgets.php', 'reminders.php', 'account.php', 'activity.php', 'categories.php'] as $p) {
             $pages[] = [$c3, $p];
         }
         $checked = [];
@@ -1880,10 +2852,18 @@ try {
     $ids = $pdo->query("SELECT id FROM users WHERE email LIKE '%\\_{$stamp}@audit.test'")->fetchAll(PDO::FETCH_COLUMN);
     foreach ($ids as $id) {
         $id = (int)$id;
+        try {
+            $files = $pdo->query("SELECT p.receipt_file FROM payments p JOIN bills b ON b.bill_id = p.bill_id
+                                  WHERE b.user_id = $id AND p.receipt_file IS NOT NULL")->fetchAll(PDO::FETCH_COLUMN);
+            array_map('deleteReceiptFile', $files);
+        } catch (PDOException $e) {
+            // migration 004 not run: no receipts
+        }
         $pdo->exec("DELETE p FROM payments p JOIN bills b ON b.bill_id = p.bill_id WHERE b.user_id = $id");
         $pdo->exec("UPDATE bills SET parent_bill_id = NULL WHERE user_id = $id");
         $pdo->exec("DELETE FROM bills WHERE user_id = $id");
-        $pdo->exec("DELETE FROM users WHERE id = $id");
+        $pdo->exec("DELETE FROM budgets WHERE user_id = $id"); // may point at a custom category
+        $pdo->exec("DELETE FROM users WHERE id = $id");       // cascades to custom categories
     }
 }
 

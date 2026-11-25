@@ -10,12 +10,15 @@ require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/csrf.php';
 require_once __DIR__ . '/includes/activity.php';
 require_once __DIR__ . '/includes/budgets.php';
+require_once __DIR__ . '/includes/categories.php';
+require_once __DIR__ . '/includes/payments.php';
+require_once __DIR__ . '/includes/recurring_bills.php'; // + recurrence.php
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
 
 $pdo = getPDO();
-$categories = $pdo->query('SELECT category_id, category_name FROM categories ORDER BY category_id')->fetchAll();
+$categories = userCategories($pdo, (int)$_SESSION['user_id']); // built-ins + this user's own
 $validCategoryIds = array_column($categories, 'category_id');
 
 $billId = $_GET['bill_id'] ?? $_POST['bill_id'] ?? '';
@@ -26,7 +29,8 @@ if (!ctype_digit((string)$billId)) {
 $billId = (int)$billId;
 
 $stmt = $pdo->prepare(
-    'SELECT bill_id, bill_name, amount, due_date, category_id, is_recurring, status
+    'SELECT bill_id, bill_name, amount, due_date, category_id, is_recurring, status'
+    . (recurrenceColumnsExist($pdo) ? ', repeat_interval, repeat_until' : ", 'monthly' AS repeat_interval, NULL AS repeat_until") . '
      FROM bills WHERE bill_id = ? AND user_id = ? LIMIT 1'
 );
 $stmt->execute([$billId, $_SESSION['user_id']]);
@@ -39,6 +43,15 @@ if (!$bill) {
 }
 
 $errors = [];
+// The saved schedule, in the shape readRepeatFields() returns, to fill the form.
+$repeat = [
+    'interval'    => $bill['repeat_interval'],
+    'until'       => $bill['repeat_until'],
+    'end'         => $bill['repeat_until'] !== null ? 'on' : 'never',
+    'until_input' => (string)$bill['repeat_until'],
+    'count_input' => '',
+    'errors'      => [],
+];
 $old = [
     'bill_name'    => $bill['bill_name'],
     'amount'       => number_format((float)$bill['amount'], 2, '.', ''),
@@ -80,22 +93,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors[] = 'Please select a valid category.';
     }
 
+    $validDue = $dueDateObj && $dueDateObj->format('Y-m-d') === $dueDate ? $dueDate : '';
+    $repeat = readRepeatFields($_POST, $isRecurring, $validDue);
+    $errors = array_merge($errors, $repeat['errors']);
+
     if (empty($errors)) {
         try {
+            // A changed schedule applies to the cycles generated from now on; bills that
+            // already exist keep their dates.
+            $withRepeat = recurrenceColumnsExist($pdo);
             $update = $pdo->prepare(
                 'UPDATE bills
-                 SET bill_name = ?, amount = ?, due_date = ?, category_id = ?, is_recurring = ?
+                 SET bill_name = ?, amount = ?, due_date = ?, category_id = ?, is_recurring = ?'
+                 . ($withRepeat ? ', repeat_interval = ?, repeat_until = ?' : '') . '
                  WHERE bill_id = ? AND user_id = ?'
             );
-            $update->execute([
+            $values = [
                 $billName,
                 (float)$amount,
                 $dueDate,
                 (int)$categoryId,
                 $isRecurring ? 1 : 0,
-                $billId,
-                $_SESSION['user_id'],
-            ]);
+            ];
+            if ($withRepeat) {
+                array_push($values, $repeat['interval'], $isRecurring ? $repeat['until'] : null);
+            }
+            array_push($values, $billId, $_SESSION['user_id']);
+            $update->execute($values);
+
+            // A new amount can change whether the payments made so far cover the bill
+            // (raise it: partially paid again; lower it: fully paid).
+            if (toCents($amount) !== toCents($bill['amount']) && billPaidTotal($pdo, $billId) > 0) {
+                refreshBillStatus($pdo, $billId);
+            }
 
             $userId = (int)$_SESSION['user_id'];
             logActivity($pdo, $userId, 'bill_updated', sprintf(
@@ -409,13 +439,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 </option>
                             <?php endforeach; ?>
                         </select>
+                        <a href="categories.php" style="display:inline-block;margin-top:6px;font-size:0.78rem;color:var(--electric-blue);text-decoration:none;">+ Manage categories</a>
                     </div>
 
-                    <div class="form-check">
-                        <input type="checkbox" id="is_recurring" name="is_recurring" value="1"
-                            <?= $old['is_recurring'] ? 'checked' : '' ?>>
-                        <label for="is_recurring">This bill repeats every month</label>
-                    </div>
+                    <?php include __DIR__ . '/partials/repeat-fields.php'; ?>
 
                     <div class="form-actions">
                         <button type="submit" class="btn-primary">

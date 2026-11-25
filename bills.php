@@ -10,6 +10,8 @@ require_once __DIR__ . '/config/database.php';
 require_once __DIR__ . '/includes/recurring_bills.php';
 require_once __DIR__ . '/includes/csrf.php';
 require_once __DIR__ . '/includes/csv.php';
+require_once __DIR__ . '/includes/xlsx.php';
+require_once __DIR__ . '/includes/categories.php';
 
 $userName = htmlspecialchars($_SESSION['user_name'] ?? 'User');
 $userInitial = strtoupper(substr($userName, 0, 1));
@@ -20,11 +22,11 @@ $pdo = getPDO();
 // bills show up immediately.
 generateMissedRecurringBills($pdo, (int)$_SESSION['user_id']);
 
-$categories = $pdo->query('SELECT category_id, category_name FROM categories ORDER BY category_id')->fetchAll();
+$categories = userCategories($pdo, (int)$_SESSION['user_id']); // built-ins + this user's own
 $validCategoryIds = array_column($categories, 'category_id');
 
 $statusFilter = $_GET['status'] ?? '';
-if (!in_array($statusFilter, ['unpaid', 'paid'], true)) {
+if (!in_array($statusFilter, ['unpaid', 'paid', 'partial'], true)) {
     $statusFilter = '';
 }
 
@@ -38,15 +40,20 @@ if (mb_strlen($search) > 100) {
     $search = mb_substr($search, 0, 100);
 }
 
-$sql = 'SELECT b.bill_id, b.bill_name, b.amount, b.due_date, b.is_recurring, b.status,
+$sql = 'SELECT b.bill_id, b.bill_name, b.amount, b.due_date, b.is_recurring, b.status, '
+     . (recurrenceColumnsExist($pdo) ? 'b.repeat_interval, b.repeat_until,' : "'monthly' AS repeat_interval, NULL AS repeat_until,") . '
                c.category_name,
-               (b.status = \'unpaid\' AND b.due_date < CURDATE()) AS is_overdue
+               (b.status = \'unpaid\' AND b.due_date < CURDATE()) AS is_overdue,
+               (SELECT COALESCE(SUM(p.amount_paid), 0) FROM payments p WHERE p.bill_id = b.bill_id) AS paid_total
         FROM bills b
         JOIN categories c ON c.category_id = b.category_id
         WHERE b.user_id = ?';
 $params = [$_SESSION['user_id']];
 
-if ($statusFilter !== '') {
+if ($statusFilter === 'partial') {
+    // Partially paid: still unpaid, but some money is already in.
+    $sql .= ' AND b.status = \'unpaid\' AND EXISTS (SELECT 1 FROM payments p WHERE p.bill_id = b.bill_id)';
+} elseif ($statusFilter !== '') {
     $sql .= ' AND b.status = ?';
     $params[] = $statusFilter;
 }
@@ -75,12 +82,54 @@ if (($_GET['export'] ?? '') === 'csv') {
             csvSafe($b['category_name']),
             number_format((float)$b['amount'], 2, '.', ''),
             $b['due_date'],
-            $b['is_overdue'] ? 'Overdue' : ucfirst($b['status']),
-            $b['is_recurring'] ? 'Monthly' : 'No',
+            $b['is_overdue'] ? 'Overdue'
+                : ($b['status'] === 'unpaid' && (float)$b['paid_total'] > 0 ? 'Partially paid' : ucfirst($b['status'])),
+            $b['is_recurring'] ? repeatLabel($b['repeat_interval'], $b['repeat_until']) : 'No',
         ]);
     }
     fclose($out);
     exit;
+}
+
+// Styled Excel export of exactly what the current filters show.
+if (($_GET['export'] ?? '') === 'xlsx') {
+    $rows = [];
+    $sum = ['amount' => 0.0, 'paid' => 0.0];
+    foreach ($bills as $b) {
+        $paid = $b['status'] === 'paid' ? (float)$b['amount'] : min((float)$b['paid_total'], (float)$b['amount']);
+        $status = $b['is_overdue'] ? 'Overdue'
+            : ($b['status'] === 'unpaid' && $paid > 0 ? 'Partially paid' : ucfirst($b['status']));
+        $rows[] = [
+            $b['bill_name'], $b['category_name'], (float)$b['amount'], $paid, round((float)$b['amount'] - $paid, 2),
+            $b['due_date'], $status, $b['is_recurring'] ? repeatLabel($b['repeat_interval'], $b['repeat_until']) : '—',
+        ];
+        $sum['amount'] += (float)$b['amount'];
+        $sum['paid'] += $paid;
+    }
+    $filters = array_filter([
+        $statusFilter !== '' ? 'Status: ' . ($statusFilter === 'partial' ? 'Partially paid' : ucfirst($statusFilter)) : '',
+        $categoryFilter !== '' ? 'Category: ' . (array_column($categories, 'category_name', 'category_id')[(int)$categoryFilter] ?? '') : '',
+        $search !== '' ? 'Search: "' . $search . '"' : '',
+    ]);
+    xlsxDownload(
+        'afterbill-bills-' . date('Y-m-d') . '.xlsx',
+        'My Bills',
+        'AfterBill — My Bills',
+        ($_SESSION['user_name'] ?? '') . ' · exported ' . date('F j, Y g:i A') . ' · ' . count($rows) . ' bill' . (count($rows) === 1 ? '' : 's')
+            . ($filters ? ' · ' . implode(' · ', $filters) : ''),
+        [
+            ['label' => 'Bill', 'type' => 'strong', 'width' => 32],
+            ['label' => 'Category', 'type' => 'text', 'width' => 18],
+            ['label' => 'Amount', 'type' => 'money', 'width' => 15],
+            ['label' => 'Paid', 'type' => 'money', 'width' => 15],
+            ['label' => 'Balance', 'type' => 'money', 'width' => 15],
+            ['label' => 'Due Date', 'type' => 'date', 'width' => 15],
+            ['label' => 'Status', 'type' => 'status', 'width' => 16],
+            ['label' => 'Repeats', 'type' => 'text', 'width' => 22],
+        ],
+        $rows,
+        ['Total', null, round($sum['amount'], 2), round($sum['paid'], 2), round($sum['amount'] - $sum['paid'], 2), null, null, null]
+    );
 }
 
 $listTotal = array_sum(array_map(fn($b) => (float)$b['amount'], $bills));
@@ -91,6 +140,13 @@ $exportQuery = http_build_query(array_filter([
     'q'           => $search,
     'export'      => 'csv',
 ], fn($v) => $v !== ''));
+$xlsxQuery = str_replace('export=csv', 'export=xlsx', $exportQuery);
+
+// One-time results of "Pay selected" (bulk_pay.php).
+$bulkPaid = $_SESSION['flash_bulk_paid'] ?? null;
+$bulkError = $_SESSION['flash_bulk_error'] ?? null;
+unset($_SESSION['flash_bulk_paid'], $_SESSION['flash_bulk_error']);
+$payableCount = count(array_filter($bills, fn($b) => $b['status'] === 'unpaid'));
 
 // One-time warning set by add_bill.php / edit_bill.php when a bill pushes its category over budget.
 $budgetWarning = $_SESSION['flash_budget_warning'] ?? null;
@@ -358,6 +414,26 @@ unset($_SESSION['flash_budget_warning']);
         .status-badge.paid    { background: #ECFDF5; color: #047857; }
         .status-badge.unpaid  { background: #FFFBEB; color: #B45309; }
         .status-badge.overdue { background: #FEF2F2; color: #B91C1C; }
+        .status-badge.partial { background: #EFF6FF; color: #1D4ED8; white-space: nowrap; }
+        .btn-excel { border-color: #10B981 !important; color: #047857 !important; }
+        .btn-excel:hover { background: #ECFDF5 !important; }
+        .btn-csv { font-size: 0.78rem; font-weight: 600; color: var(--text-muted); text-decoration: none; padding: 6px 4px; }
+        .btn-csv:hover { color: var(--electric-blue); text-decoration: underline; }
+        .bulk-bar {
+            display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 16px;
+            padding: 12px 16px; background: var(--white); border: 1px solid var(--border); border-radius: 12px;
+            font-size: 0.82rem;
+        }
+        .bulk-bar .bulk-title { font-weight: 700; color: var(--deep-navy); }
+        .bulk-bar label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-weight: 600; }
+        .bulk-bar input, .bulk-bar select {
+            padding: 6px 8px; border: 1.5px solid var(--border); border-radius: 7px; font-family: inherit; font-size: 0.8rem;
+        }
+        .bulk-bar .btn-primary { padding: 8px 16px; }
+        .bulk-bar .bulk-hint { color: var(--text-muted); font-size: 0.75rem; }
+        th.check-col, td.check-col { width: 36px; padding-right: 0; }
+        .check-col input { width: 16px; height: 16px; cursor: pointer; }
+        .bill-balance { display: block; margin-top: 3px; font-size: 0.72rem; color: var(--text-muted); white-space: nowrap; }
 
         .btn-pay {
             display: inline-flex;
@@ -446,7 +522,8 @@ unset($_SESSION['flash_budget_warning']);
                     Add Bill
                 </a>
                 <?php if ($bills): ?>
-                    <a href="bills.php?<?= htmlspecialchars($exportQuery) ?>" class="btn-edit" title="Download the bills shown below as a spreadsheet">Export CSV</a>
+                    <a href="bills.php?<?= htmlspecialchars($xlsxQuery) ?>" class="btn-edit btn-excel" title="Download the bills shown below as a formatted Excel file">Export Excel</a>
+                    <a href="bills.php?<?= htmlspecialchars($exportQuery) ?>" class="btn-csv" title="Plain CSV, for importing into other apps">CSV</a>
                 <?php endif; ?>
                 <?php require __DIR__ . '/partials/logout-button.php'; ?>
             </div>
@@ -466,6 +543,17 @@ unset($_SESSION['flash_budget_warning']);
                 <div class="alert alert-success">Payment recorded. Bill marked as paid.</div>
             <?php endif; ?>
 
+            <?php if ($bulkPaid !== null): ?>
+                <div class="alert alert-success"><?= htmlspecialchars($bulkPaid) ?></div>
+            <?php endif; ?>
+            <?php if ($bulkError !== null): ?>
+                <div class="alert alert-error"><?= htmlspecialchars($bulkError) ?></div>
+            <?php endif; ?>
+
+            <?php if (isset($_GET['partial'])): ?>
+                <div class="alert alert-success">Partial payment recorded. The rest of the bill is still due.</div>
+            <?php endif; ?>
+
             <?php if (isset($_GET['updated'])): ?>
                 <div class="alert alert-success">Bill updated successfully.</div>
             <?php endif; ?>
@@ -475,7 +563,7 @@ unset($_SESSION['flash_budget_warning']);
             <?php endif; ?>
 
             <?php if (isset($_GET['unpaid'])): ?>
-                <div class="alert alert-success">Payment undone. Bill is unpaid again.</div>
+                <div class="alert alert-success">Payments undone. Bill is unpaid again.</div>
             <?php endif; ?>
 
             <?php if (isset($_GET['delete_blocked'])): ?>
@@ -493,6 +581,7 @@ unset($_SESSION['flash_budget_warning']);
                     <select id="status" name="status" data-autosubmit>
                         <option value="" <?= $statusFilter === '' ? 'selected' : '' ?>>All</option>
                         <option value="unpaid" <?= $statusFilter === 'unpaid' ? 'selected' : '' ?>>Unpaid</option>
+                        <option value="partial" <?= $statusFilter === 'partial' ? 'selected' : '' ?>>Partially paid</option>
                         <option value="paid" <?= $statusFilter === 'paid' ? 'selected' : '' ?>>Paid</option>
                     </select>
                 </div>
@@ -519,6 +608,30 @@ unset($_SESSION['flash_budget_warning']);
                 <?php endif; ?>
             </form>
 
+            <?php if ($payableCount > 0): ?>
+                <form method="POST" action="bulk_pay.php" id="bulk-pay" class="bulk-bar"
+                      data-confirm="Pay the full remaining balance of every ticked bill?">
+                    <?= csrf_field() ?>
+                    <span class="bulk-title">Pay selected bills</span>
+                    <label>Paid on
+                        <input type="date" name="payment_date" value="<?= date('Y-m-d') ?>" max="<?= date('Y-m-d') ?>" required>
+                    </label>
+                    <label>Method
+                        <select name="payment_method" required>
+                            <option value="">Choose…</option>
+                            <option value="cash">Cash</option>
+                            <option value="bank_transfer">Bank Transfer</option>
+                            <option value="gcash">GCash</option>
+                            <option value="debit_card">Debit Card</option>
+                            <option value="credit_card">Credit Card</option>
+                            <option value="other">Other</option>
+                        </select>
+                    </label>
+                    <button type="submit" class="btn-primary">Pay selected</button>
+                    <span class="bulk-hint">Tick bills below. Each one is paid in full (its remaining balance).</span>
+                </form>
+            <?php endif; ?>
+
             <div class="panel">
                 <?php if (empty($bills)): ?>
                     <div class="empty-state">
@@ -533,6 +646,11 @@ unset($_SESSION['flash_budget_warning']);
                         <table>
                             <thead>
                                 <tr>
+                                    <th class="check-col">
+                                        <?php if ($payableCount > 0): ?>
+                                            <input type="checkbox" data-check-all="bill_ids[]" form="bulk-pay" aria-label="Select all unpaid bills">
+                                        <?php endif; ?>
+                                    </th>
                                     <th>Bill Name</th>
                                     <th>Category</th>
                                     <th>Amount</th>
@@ -544,35 +662,51 @@ unset($_SESSION['flash_budget_warning']);
                             <tbody>
                                 <?php foreach ($bills as $bill): ?>
                                     <?php
+                                        $paidTotal = (float)$bill['paid_total'];
+                                        $isPartial = $bill['status'] === 'unpaid' && $paidTotal > 0;
                                         if ($bill['is_overdue']) {
                                             $statusClass = 'overdue';
                                             $statusLabel = 'Overdue';
                                         } elseif ($bill['status'] === 'paid') {
                                             $statusClass = 'paid';
                                             $statusLabel = 'Paid';
+                                        } elseif ($isPartial) {
+                                            $statusClass = 'partial';
+                                            $statusLabel = 'Partially paid';
                                         } else {
                                             $statusClass = 'unpaid';
                                             $statusLabel = 'Unpaid';
                                         }
                                     ?>
                                     <tr>
+                                        <td class="check-col">
+                                            <?php if ($bill['status'] === 'unpaid'): ?>
+                                                <input type="checkbox" name="bill_ids[]" value="<?= (int)$bill['bill_id'] ?>" form="bulk-pay"
+                                                       aria-label="Select <?= htmlspecialchars($bill['bill_name']) ?>">
+                                            <?php endif; ?>
+                                        </td>
                                         <td class="bill-name-cell">
                                             <?= htmlspecialchars($bill['bill_name']) ?>
                                             <?php if ($bill['is_recurring']): ?>
-                                                <span class="bill-recurring-tag">Recurring</span>
+                                                <span class="bill-recurring-tag" title="Repeats: <?= htmlspecialchars(repeatLabel($bill['repeat_interval'], $bill['repeat_until'])) ?>"><?= htmlspecialchars(REPEAT_INTERVALS[$bill['repeat_interval']] ?? 'Recurring') ?></span>
                                             <?php endif; ?>
                                         </td>
                                         <td><?= htmlspecialchars($bill['category_name']) ?></td>
-                                        <td>₱<?= number_format((float)$bill['amount'], 2) ?></td>
+                                        <td>
+                                            ₱<?= number_format((float)$bill['amount'], 2) ?>
+                                            <?php if ($isPartial): ?>
+                                                <span class="bill-balance">₱<?= number_format($paidTotal, 2) ?> paid · ₱<?= number_format(max(0, (float)$bill['amount'] - $paidTotal), 2) ?> left</span>
+                                            <?php endif; ?>
+                                        </td>
                                         <td><?= htmlspecialchars((new DateTime($bill['due_date']))->format('M j, Y')) ?></td>
                                         <td><span class="status-badge <?= $statusClass ?>"><?= $statusLabel ?></span></td>
                                         <td>
                                             <div class="actions-cell">
                                                 <?php if ($bill['status'] === 'unpaid'): ?>
-                                                    <a href="mark_paid.php?bill_id=<?= (int)$bill['bill_id'] ?>" class="btn-pay">Mark as Paid</a>
+                                                    <a href="mark_paid.php?bill_id=<?= (int)$bill['bill_id'] ?>" class="btn-pay"><?= $isPartial ? 'Add Payment' : 'Mark as Paid' ?></a>
                                                 <?php else: ?>
                                                     <form method="POST" action="undo_payment.php" class="delete-form"
-                                                        data-confirm="<?= htmlspecialchars('Undo the payment for "' . $bill['bill_name'] . '"? Its payment record will be removed and the bill set back to unpaid.') ?>">
+                                                        data-confirm="<?= htmlspecialchars('Undo the payments for "' . $bill['bill_name'] . '"? All of its payment records and receipts will be removed and the bill set back to unpaid.') ?>">
                                                         <input type="hidden" name="bill_id" value="<?= (int)$bill['bill_id'] ?>">
                                                         <input type="hidden" name="return" value="bills">
                                                         <?= csrf_field() ?>
